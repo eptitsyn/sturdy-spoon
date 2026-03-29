@@ -5,18 +5,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
+import warnings
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"`isinstance\(treespec, LeafSpec\)` is deprecated.*",
+    category=DeprecationWarning,
+    module=r"pytorch_lightning\.utilities\._pytree",
+)
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
 from sklearn.metrics import f1_score, precision_recall_curve, roc_auc_score
 from sklearn.model_selection import train_test_split
 
@@ -49,7 +59,7 @@ class TrainConfig:
     patience: int = 3
     grad_clip_val: float = 1.0
     accumulate_grad_batches: int = 1
-    num_workers: int = 0
+    num_workers: int = -1
 
     # Paths
     save_dir: str = "checkpoints"
@@ -144,6 +154,23 @@ def _calibrate_threshold(
     return threshold
 
 
+def _configure_torch_runtime() -> None:
+    if not torch.cuda.is_available():
+        return
+    torch.set_float32_matmul_precision("high")
+    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def _resolve_num_workers(num_workers: int) -> int:
+    if num_workers >= 0:
+        return num_workers
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(11, cpu_count - 1))
+
+
 class AIDetectorModule(pl.LightningModule):
     """LightningModule wrapping AITextDetector."""
 
@@ -201,21 +228,19 @@ class AIDetectorModule(pl.LightningModule):
         optimizer = AdamW(
             self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay
         )
-        warmup_steps = min(self.cfg.warmup_steps, max(self.total_steps - 1, 1))
-        decay_steps = max(self.total_steps - warmup_steps, 1)
+        warmup_steps = min(self.cfg.warmup_steps, max(self.total_steps - 1, 0))
 
-        warmup = LinearLR(
-            optimizer,
-            start_factor=0.1,
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-        cosine = CosineAnnealingLR(optimizer, T_max=decay_steps)
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup, cosine],
-            milestones=[warmup_steps],
-        )
+        def lr_lambda(current_step: int) -> float:
+            if self.total_steps <= 1:
+                return 1.0
+            if warmup_steps > 0 and current_step < warmup_steps:
+                return 0.1 + 0.9 * (current_step / max(1, warmup_steps))
+
+            progress = (current_step - warmup_steps) / max(1, self.total_steps - warmup_steps)
+            progress = min(max(progress, 0.0), 1.0)
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
@@ -240,6 +265,8 @@ def train(
     """
     cfg = config or TrainConfig()
     torch.manual_seed(cfg.seed)
+    _configure_torch_runtime()
+    num_workers = _resolve_num_workers(cfg.num_workers)
 
     # ── Tokenizer & Data ─────────────────────────────────────────────────
     train_texts, val_texts, train_labels, val_labels = _split_train_val(
@@ -261,16 +288,16 @@ def train(
         batch_size=cfg.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=cfg.num_workers,
-        persistent_workers=cfg.num_workers > 0,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
         pin_memory=torch.cuda.is_available(),
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.batch_size,
         collate_fn=collate_fn,
-        num_workers=cfg.num_workers,
-        persistent_workers=cfg.num_workers > 0,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -313,6 +340,7 @@ def train(
     )
 
     use_amp = cfg.use_amp and torch.cuda.is_available()
+    logger = CSVLogger(save_dir=str(save_dir), name="logs")
     trainer = pl.Trainer(
         max_epochs=cfg.epochs,
         callbacks=[checkpoint_cb, early_stopping_cb],
@@ -321,6 +349,8 @@ def train(
         log_every_n_steps=10,
         gradient_clip_val=cfg.grad_clip_val,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
+        logger=logger,
+        enable_model_summary=False,
     )
 
     trainer.fit(lit_model, train_loader, val_loader)

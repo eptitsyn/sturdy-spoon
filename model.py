@@ -69,7 +69,17 @@ class AITextDetector(nn.Module):
             batch_first=True,
             norm_first=True,  # Pre-LN — стабильнее тренируется
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        transformer_kwargs = {"num_layers": num_layers}
+        # Nested tensors are incompatible with norm_first=True in current torch,
+        # so disable that path explicitly to avoid the startup warning.
+        try:
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer,
+                enable_nested_tensor=False,
+                **transformer_kwargs,
+            )
+        except TypeError:
+            self.transformer = nn.TransformerEncoder(encoder_layer, **transformer_kwargs)
         self.layer_norm = nn.LayerNorm(d_model)
 
         # CLS-only pooling is usually weak when training from scratch, so we
