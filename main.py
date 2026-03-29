@@ -38,8 +38,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional local source path in the form source=/abs/path. Needed for daigt_proper and m_daigt.",
     )
     p.add_argument("--max-per-source", type=int, default=100_000)
-    p.add_argument("--max-total", type=int, default=100_000)
-    p.add_argument("--min-text-len", type=int, default=50)
+    p.add_argument("--max-total", type=int, default=200_000)
+    p.add_argument("--min-text-len", type=int, default=10)
     p.add_argument("--max-text-len", type=int, default=3_000)
     p.add_argument("--test-ratio", type=float, default=0.15, help="Доля тестовой выборки")
     p.add_argument("--cache-dir", default=".cache/datasets")
