@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import csv
 import hashlib
 import json
@@ -33,6 +34,19 @@ from pathlib import Path
 from typing import Iterator
 
 from datasets import load_dataset
+from ui import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    RICH_AVAILABLE,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    console,
+    print_info,
+    print_success,
+    print_warning,
+)
 
 
 # ─── Types ────────────────────────────────────────────────────────────────────
@@ -115,12 +129,13 @@ _KAGGLE_DATASETS = {
     "daigt_proper": "thedrcat/daigt-v2-train-dataset",
     "daigt_v2": "thedrcat/daigt-v2-train-dataset",
 }
-_SOURCE_CACHE_SCHEMA_VERSION = 5
+_SOURCE_CACHE_SCHEMA_VERSION = 6
 _SOURCE_ALIASES = {
     "ruatd": "coat",
     "daigt_v2": "daigt_proper",
     "gsingh1_train": "gsingh_train",
 }
+_HF_SNAPSHOT_PATTERNS = ["**/*.parquet", "**/*.jsonl", "**/*.json", "**/*.csv", "**/*.tsv"]
 
 
 def _clean_text(value) -> str:
@@ -132,6 +147,33 @@ def _clean_text(value) -> str:
         parts = [str(item).strip() for item in value if str(item).strip()]
         return "\n".join(parts)
     return str(value).strip()
+
+
+def _normalize_label_text(value) -> str:
+    return _clean_text(value).strip("\"'").strip().lower()
+
+
+def _raw_source_dir(source_name: str, cfg: DatasetConfig) -> Path:
+    path = Path(cfg.cache_dir).expanduser() / "raw_sources" / source_name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _reservoir_add(
+    reservoir: list[Sample],
+    sample: Sample,
+    seen_count: int,
+    capacity: int,
+    rng: random.Random,
+) -> None:
+    if capacity <= 0:
+        return
+    if len(reservoir) < capacity:
+        reservoir.append(sample)
+        return
+    replace_idx = rng.randint(0, seen_count - 1)
+    if replace_idx < capacity:
+        reservoir[replace_idx] = sample
 
 
 def _canonical_source_name(source_name: str) -> str:
@@ -253,11 +295,25 @@ def _materialize_source(
     return samples
 
 
+def _ensure_hf_raw_source(source_name: str, repo_id: str, cfg: DatasetConfig) -> Path:
+    from huggingface_hub import snapshot_download
+
+    raw_dir = _raw_source_dir(source_name, cfg)
+    if any(path.is_file() and path.suffix.lower() in _SUPPORTED_LOCAL_SUFFIXES for path in raw_dir.rglob("*")):
+        return raw_dir
+
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=str(raw_dir),
+        allow_patterns=_HF_SNAPSHOT_PATTERNS,
+    )
+    return raw_dir
+
+
 def _download_kaggle_dataset(source_name: str, cfg: DatasetConfig) -> Path:
     dataset_slug = _KAGGLE_DATASETS[source_name]
-    cache_root = Path(cfg.cache_dir).expanduser()
-    target_dir = cache_root / source_name
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = _raw_source_dir(source_name, cfg)
 
     existing_files = list(target_dir.rglob("*"))
     if any(path.is_file() and path.suffix.lower() in _SUPPORTED_LOCAL_SUFFIXES for path in existing_files):
@@ -326,7 +382,14 @@ def _resolve_local_source_path(source_name: str, cfg: DatasetConfig) -> Path:
     return path
 
 
-def _iter_local_rows(path: Path) -> Iterator[tuple[dict, Path]]:
+def _file_matches_split(path: Path, split_hint: str) -> bool:
+    split_hint = split_hint.lower()
+    if split_hint in path.stem.lower():
+        return True
+    return any(split_hint in parent.name.lower() for parent in path.parents)
+
+
+def _iter_local_rows(path: Path, split_hint: str | None = None) -> Iterator[tuple[dict, Path]]:
     if path.is_file():
         files = [path]
     else:
@@ -334,6 +397,11 @@ def _iter_local_rows(path: Path) -> Iterator[tuple[dict, Path]]:
             p for p in path.rglob("*")
             if p.is_file() and p.suffix.lower() in _SUPPORTED_LOCAL_SUFFIXES
         )
+
+    if split_hint:
+        split_files = [file_path for file_path in files if _file_matches_split(file_path, split_hint)]
+        if split_files:
+            files = split_files
 
     if not files:
         raise FileNotFoundError(f"No supported data files found in {path}")
@@ -478,9 +546,9 @@ def _iter_raid(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[S
     Самый большой бенчмарк: 11 LLM, 8 доменов, атаки на детекторы.
     model='human' → human, иначе → AI.
     """
-    ds = load_dataset("liamdugan/raid", split="train", streaming=True)
     count = 0
-    for row in ds:
+    raw_dir = _ensure_hf_raw_source("raid", "liamdugan/raid", cfg or DatasetConfig())
+    for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         text = (row.get("generation") or "").strip()
         if not text:
             continue
@@ -503,15 +571,16 @@ def _iter_ai_pile(max_samples: int, cfg: DatasetConfig | None = None) -> Iterato
     Long-form essays: human, GPT-2, GPT-3, ChatGPT, GPT-J.
     """
     seed = (cfg.seed if cfg is not None else 42)
-    ds = load_dataset("artem9k/ai-text-detection-pile", split="train", streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=min(max_samples * 8, 50_000))
     rng = random.Random(seed)
     target_human = max_samples // 2
     target_ai = max_samples - target_human
     humans: list[Sample] = []
     ais: list[Sample] = []
+    seen_humans = 0
+    seen_ais = 0
 
-    for row in ds:
+    raw_dir = _ensure_hf_raw_source("ai_pile", "artem9k/ai-text-detection-pile", cfg or DatasetConfig())
+    for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         text = (row.get("text") or "").strip()
         if not text:
             continue
@@ -525,14 +594,11 @@ def _iter_ai_pile(max_samples: int, cfg: DatasetConfig | None = None) -> Iterato
         )
 
         if sample.label == Label.HUMAN:
-            if len(humans) < target_human:
-                humans.append(sample)
+            seen_humans += 1
+            _reservoir_add(humans, sample, seen_humans, target_human, rng)
         else:
-            if len(ais) < target_ai:
-                ais.append(sample)
-
-        if len(humans) >= target_human and len(ais) >= target_ai:
-            break
+            seen_ais += 1
+            _reservoir_add(ais, sample, seen_ais, target_ai, rng)
 
     samples = humans + ais
     rng.shuffle(samples)
@@ -546,9 +612,9 @@ def _iter_gpt_wiki(max_samples: int, cfg: DatasetConfig | None = None) -> Iterat
     Paired: Wikipedia intro (human) vs GPT-3 generated intro.
     Каждый ряд даёт 2 сэмпла.
     """
-    ds = load_dataset("aadityaubhat/GPT-wiki-intro", split="train", streaming=True)
     count = 0
-    for row in ds:
+    raw_dir = _ensure_hf_raw_source("gpt_wiki", "aadityaubhat/GPT-wiki-intro", cfg or DatasetConfig())
+    for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         wiki = (row.get("wiki_intro") or "").strip()
         gen = (row.get("generated_intro") or "").strip()
 
@@ -582,9 +648,9 @@ def _iter_human_vs_ai(max_samples: int, cfg: DatasetConfig | None = None) -> Ite
     dmitva/human_ai_generated_text
     Paired: human essays vs AI-generated essays.
     """
-    ds = load_dataset("dmitva/human_ai_generated_text", split="train", streaming=True)
     count = 0
-    for row in ds:
+    raw_dir = _ensure_hf_raw_source("human_vs_ai", "dmitva/human_ai_generated_text", cfg or DatasetConfig())
+    for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         human = (row.get("human_text") or "").strip()
         ai = (row.get("ai_text") or "").strip()
 
@@ -619,9 +685,9 @@ def _iter_ai_human_mixed(max_samples: int, cfg: DatasetConfig | None = None) -> 
     GPT-4, BARD и human тексты разных жанров.
     label: 0 = human, 1 = AI.
     """
-    ds = load_dataset("Ateeqq/AI-and-Human-Generated-Text", split="train", streaming=True)
     count = 0
-    for row in ds:
+    raw_dir = _ensure_hf_raw_source("ai_human_mixed", "Ateeqq/AI-and-Human-Generated-Text", cfg or DatasetConfig())
+    for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         text = (row.get("abstract") or "").strip()
         if not text:
             continue
@@ -647,7 +713,13 @@ def _iter_hc3(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sa
     import json
     from huggingface_hub import hf_hub_download
 
-    path = hf_hub_download("Hello-SimpleAI/HC3", "all.jsonl", repo_type="dataset")
+    raw_dir = _raw_source_dir("hc3", cfg or DatasetConfig())
+    path = hf_hub_download(
+        "Hello-SimpleAI/HC3",
+        "all.jsonl",
+        repo_type="dataset",
+        local_dir=str(raw_dir),
+    )
     count = 0
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -692,15 +764,16 @@ def _iter_coat(max_samples: int, cfg: DatasetConfig | None = None, source_name: 
     CoAT: RussianNLP/coat
     Public binary subset for Russian AI-text detection.
     """
-    ds = load_dataset("RussianNLP/coat", "binary", split="train", streaming=True)
     count = 0
-    for row in ds:
+    raw_dir = _ensure_hf_raw_source(source_name, "RussianNLP/coat", cfg or DatasetConfig())
+    for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         text = _clean_text(row.get("text"))
         raw_label = _clean_text(row.get("label"))
+        normalized_label = _normalize_label_text(row.get("label"))
         if not text or not raw_label:
             continue
 
-        if raw_label.lower() == "human":
+        if normalized_label == "human":
             label = Label.HUMAN
             generator = "human"
         else:
@@ -732,7 +805,6 @@ def _iter_gsingh_train(max_samples: int, cfg: DatasetConfig | None = None) -> It
     gsingh1-py/train
     One human story plus several model-generated variants per prompt.
     """
-    ds = load_dataset("gsingh1-py/train", split="train", streaming=True)
     count = 0
     ai_columns = [
         "gemma-2-9b",
@@ -743,7 +815,8 @@ def _iter_gsingh_train(max_samples: int, cfg: DatasetConfig | None = None) -> It
         "GPT_4-o",
     ]
 
-    for row in ds:
+    raw_dir = _ensure_hf_raw_source("gsingh_train", "gsingh1-py/train", cfg or DatasetConfig())
+    for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         human_text = _clean_text(row.get("Human_story"))
         if human_text:
             yield Sample(
@@ -856,7 +929,7 @@ def load_combined_dataset(config: DatasetConfig | None = None) -> LoadResult:
     for source_name in filtered_sources:
         canonical_name = _canonical_source_name(source_name)
         if canonical_name in seen_canonical_sources:
-            print(
+            print_warning(
                 f"Skipping {source_name} because it duplicates "
                 f"{canonical_name}."
             )
@@ -871,30 +944,55 @@ def load_combined_dataset(config: DatasetConfig | None = None) -> LoadResult:
     all_samples: list[Sample] = []
     source_stats: dict[str, dict] = {}
 
-    for src_name in sources:
-        print(f"Loading {src_name}...")
-        loader = _SOURCE_REGISTRY[src_name]
-        src_samples: list[Sample] = []
+    progress_context = (
+        Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        )
+        if RICH_AVAILABLE
+        else nullcontext()
+    )
+    with progress_context as progress:
+        task_id = progress.add_task("Loading datasets", total=len(sources)) if RICH_AVAILABLE else None
+        for src_name in sources:
+            if RICH_AVAILABLE:
+                progress.update(task_id, description=f"Loading {src_name}")
+            else:
+                print_info(f"Loading {src_name}...")
 
-        try:
-            loaded_samples = _materialize_source(src_name, cfg.max_per_source, cfg, loader)
-            for sample in loaded_samples:
-                # Фильтр по длине
-                if len(sample.text) < cfg.min_text_length:
-                    continue
-                if len(sample.text) > cfg.max_text_length:
-                    sample.text = sample.text[: cfg.max_text_length]
-                src_samples.append(sample)
-        except Exception as e:
-            print(f"  ⚠ Failed to load {src_name}: {e}")
-            continue
+            loader = _SOURCE_REGISTRY[src_name]
+            src_samples: list[Sample] = []
 
-        n_human = sum(1 for s in src_samples if s.label == Label.HUMAN)
-        n_ai = len(src_samples) - n_human
-        source_stats[src_name] = {"total": len(src_samples), "human": n_human, "ai": n_ai}
-        print(f"  ✓ {len(src_samples):,} samples (human={n_human:,}, ai={n_ai:,})")
+            try:
+                loaded_samples = _materialize_source(src_name, cfg.max_per_source, cfg, loader)
+                for sample in loaded_samples:
+                    # Фильтр по длине
+                    if len(sample.text) < cfg.min_text_length:
+                        continue
+                    if len(sample.text) > cfg.max_text_length:
+                        sample.text = sample.text[: cfg.max_text_length]
+                    src_samples.append(sample)
+            except Exception as e:
+                print_warning(f"Failed to load {src_name}: {e}")
+                if RICH_AVAILABLE:
+                    progress.advance(task_id)
+                continue
 
-        all_samples.extend(src_samples)
+            n_human = sum(1 for s in src_samples if s.label == Label.HUMAN)
+            n_ai = len(src_samples) - n_human
+            source_stats[src_name] = {"total": len(src_samples), "human": n_human, "ai": n_ai}
+            print_success(
+                f"Loaded {src_name}: {len(src_samples):,} samples "
+                f"(human={n_human:,}, ai={n_ai:,})"
+            )
+
+            all_samples.extend(src_samples)
+            if RICH_AVAILABLE:
+                progress.advance(task_id)
 
     if not all_samples:
         raise RuntimeError("Не удалось загрузить ни одного сэмпла.")
@@ -937,12 +1035,12 @@ def load_combined_dataset(config: DatasetConfig | None = None) -> LoadResult:
         "generators": dict(sorted(generators.items(), key=lambda x: -x[1])),
     }
 
-    print(f"\n{'='*50}")
-    print(f"Combined dataset: {len(all_samples):,} samples")
-    print(f"  Human: {n_human:,} | AI: {n_ai:,}")
-    print(f"  Sources: {list(source_stats)}")
-    print(f"  Generators: {stats['generators']}")
-    print(f"{'='*50}\n")
+    print_info("")
+    print_info(f"Combined dataset: {len(all_samples):,} samples")
+    print_info(f"  Human: {n_human:,} | AI: {n_ai:,}")
+    print_info(f"  Sources: {list(source_stats)}")
+    print_info(f"  Generators: {stats['generators']}")
+    print_info("")
 
     texts = [s.text for s in all_samples]
     labels = [s.label.value for s in all_samples]

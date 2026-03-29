@@ -10,7 +10,7 @@ import torch
 from torch.amp import autocast
 
 from model import AITextDetector
-from data import WordTokenizer
+from data import BPETokenizer
 
 
 @dataclass
@@ -26,7 +26,7 @@ class Detector:
     def __init__(
         self,
         model: AITextDetector,
-        tokenizer: WordTokenizer,
+        tokenizer: BPETokenizer,
         device: str = "auto",
         threshold: float = 0.5,
     ):
@@ -41,7 +41,13 @@ class Detector:
     def from_checkpoint(cls, checkpoint_dir: str | Path, device: str = "auto", **model_kwargs) -> Detector:
         """Загрузка из сохранённого чекпоинта."""
         ckpt = Path(checkpoint_dir)
-        tokenizer = WordTokenizer.load(ckpt / "tokenizer.json")
+        tokenizer_path = ckpt / "tokenizer"
+        if not tokenizer_path.exists():
+            raise FileNotFoundError(
+                "Tokenizer directory not found in checkpoint. "
+                "Retrain the model with the new BPE tokenizer."
+            )
+        tokenizer = BPETokenizer.load(tokenizer_path)
         saved_model_config = {}
         model_config_path = ckpt / "model_config.json"
         if model_config_path.exists():

@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint-dir",
         type=Path,
         default=Path("checkpoints"),
-        help="Directory with tokenizer.json and best_model.pt.",
+        help="Directory with tokenizer/ and best_model.pt.",
     )
     parser.add_argument(
         "--device",
@@ -68,16 +68,18 @@ def load_texts(path: Path) -> list[str]:
 
 def validate_checkpoint_dir(checkpoint_dir: Path) -> None:
     required_files = [
-        checkpoint_dir / "tokenizer.json",
         checkpoint_dir / "best_model.pt",
     ]
+    tokenizer_dir = checkpoint_dir / "tokenizer"
+    if not tokenizer_dir.exists():
+        required_files.append(tokenizer_dir)
     missing = [str(path) for path in required_files if not path.exists()]
     if missing:
         missing_list = "\n".join(f"  - {path}" for path in missing)
         raise FileNotFoundError(
             "Inference-ready checkpoint files are missing:\n"
             f"{missing_list}\n"
-            "Run training until it exports tokenizer.json and best_model.pt to the checkpoint directory."
+            "Run training until it exports tokenizer/ and best_model.pt to the checkpoint directory."
         )
 
 

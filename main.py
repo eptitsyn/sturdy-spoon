@@ -23,6 +23,7 @@ from dataset_loader import load_combined_dataset, DatasetConfig
 from train import train, TrainConfig
 from inference import Detector
 from evaluate import evaluate_model, evaluate_per_source, print_eval_report, print_source_breakdown
+from ui import RICH_AVAILABLE, Table, box, console, print_info, print_section
 
 
 def parse_args() -> argparse.Namespace:
@@ -122,9 +123,7 @@ def main():
     source_paths = parse_source_paths(args.source_path)
 
     # ── 1. Загрузка данных ───────────────────────────────────────────────
-    print("=" * 60)
-    print("  STEP 1: Loading combined dataset")
-    print("=" * 60)
+    print_section("STEP 1: Loading combined dataset")
 
     data_cfg = DatasetConfig(
         sources=args.sources,
@@ -145,12 +144,10 @@ def main():
     train_texts, train_labels, test_texts, test_labels, test_samples = split_data(
         result, args.test_ratio, args.seed
     )
-    print(f"Train: {len(train_texts):,} | Test: {len(test_texts):,}")
+    print_info(f"Train: {len(train_texts):,} | Test: {len(test_texts):,}")
 
     # ── 2. Тренировка ────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  STEP 2: Training")
-    print("=" * 60)
+    print_section("STEP 2: Training")
 
     train_cfg = TrainConfig(
         d_model=args.d_model,
@@ -168,9 +165,7 @@ def main():
     model, tokenizer, threshold = train(train_texts, train_labels, train_cfg)
 
     # ── 3. Оценка на тестовой выборке ────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  STEP 3: Evaluation on held-out test set")
-    print("=" * 60)
+    print_section("STEP 3: Evaluation on held-out test set")
 
     eval_result = evaluate_model(
         model, tokenizer, test_texts, test_labels,
@@ -186,9 +181,7 @@ def main():
         print_source_breakdown(breakdowns)
 
     # ── 5. Живые примеры ─────────────────────────────────────────────────
-    print("=" * 60)
-    print("  STEP 4: Live inference examples")
-    print("=" * 60)
+    print_section("STEP 4: Live inference examples")
 
     examples = [
         ("Ну блин, опять забыл зонт и промок как собака.", "Human"),
@@ -202,23 +195,36 @@ def main():
          "systems requires a holistic understanding of the underlying frameworks.", "AI"),
     ]
 
-    print()
     correct = 0
-    for text, expected in examples:
-        r = detector.predict(text)
-        ok = "✓" if r.label == expected else "✗"
-        correct += ok == "✓"
-        bar = "█" * int(r.confidence * 20) + "░" * (20 - int(r.confidence * 20))
-        print(f"  {ok} [{r.label:>5}] {r.confidence:.1%} {bar}  {text[:75]}...")
+    if RICH_AVAILABLE:
+        table = Table(title="Live inference examples", box=box.SIMPLE_HEAVY)
+        table.add_column("OK", justify="center")
+        table.add_column("Pred", justify="center")
+        table.add_column("Conf", justify="right")
+        table.add_column("Text")
+        for text, expected in examples:
+            r = detector.predict(text)
+            ok = "✓" if r.label == expected else "✗"
+            correct += ok == "✓"
+            table.add_row(ok, r.label, f"{r.confidence:.1%}", text[:95] + ("..." if len(text) > 95 else ""))
+        console.print(table)
+    else:
+        print()
+        for text, expected in examples:
+            r = detector.predict(text)
+            ok = "✓" if r.label == expected else "✗"
+            correct += ok == "✓"
+            bar = "█" * int(r.confidence * 20) + "░" * (20 - int(r.confidence * 20))
+            print(f"  {ok} [{r.label:>5}] {r.confidence:.1%} {bar}  {text[:75]}...")
 
-    print(f"\n  Live accuracy: {correct}/{len(examples)}")
-    print(f"\n  Model saved to: checkpoints/")
-    print(f"  Threshold: {threshold:.3f}")
-    print(f"  Usage:")
-    print(f"    from inference import Detector")
-    print(f"    detector = Detector.from_checkpoint('checkpoints/')")
-    print(f"    result = detector.predict('some text')")
-    print(f"    print(result.label, result.confidence)")
+    print_info(f"Live accuracy: {correct}/{len(examples)}")
+    print_info("Model saved to: checkpoints/")
+    print_info(f"Threshold: {threshold:.3f}")
+    print_info("Usage:")
+    print_info("  from inference import Detector")
+    print_info("  detector = Detector.from_checkpoint('checkpoints/')")
+    print_info("  result = detector.predict('some text')")
+    print_info("  print(result.label, result.confidence)")
 
 
 if __name__ == "__main__":

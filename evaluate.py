@@ -23,8 +23,9 @@ from sklearn.metrics import (
 )
 
 from model import AITextDetector
-from data import WordTokenizer, TextClassificationDataset, collate_fn
+from data import BPETokenizer, TextClassificationDataset, collate_fn
 from inference import Detector
+from ui import RICH_AVAILABLE, Table, box, console, print_info, print_section
 
 
 # ─── Основные метрики ─────────────────────────────────────────────────────────
@@ -48,7 +49,7 @@ class EvalResult:
 
 def evaluate_model(
     model: AITextDetector,
-    tokenizer: WordTokenizer,
+    tokenizer: BPETokenizer,
     texts: Sequence[str],
     labels: Sequence[int],
     batch_size: int = 32,
@@ -201,6 +202,39 @@ def evaluate_per_source(
 
 def print_eval_report(result: EvalResult, title: str = "Evaluation Report"):
     """Красивый вывод результатов."""
+    if RICH_AVAILABLE:
+        print_section(title)
+
+        summary = Table(box=box.SIMPLE_HEAVY)
+        summary.add_column("Metric")
+        summary.add_column("Value", justify="right")
+        summary.add_row("Accuracy", f"{result.accuracy:.4f}")
+        summary.add_row("F1 (macro)", f"{result.f1:.4f}")
+        summary.add_row("ROC-AUC", f"{result.roc_auc:.4f}")
+        summary.add_row("Threshold", f"{result.threshold_used:.3f}")
+        summary.add_row("Opt. thresh", f"{result.optimal_threshold:.3f}")
+        console.print(summary)
+
+        class_table = Table(title="Per-class metrics", box=box.SIMPLE_HEAVY)
+        class_table.add_column("Class")
+        class_table.add_column("Precision", justify="right")
+        class_table.add_column("Recall", justify="right")
+        class_table.add_column("F1", justify="right")
+        class_table.add_row("Human", f"{result.precision_human:.4f}", f"{result.recall_human:.4f}", f"{result.f1_human:.4f}")
+        class_table.add_row("AI", f"{result.precision_ai:.4f}", f"{result.recall_ai:.4f}", f"{result.f1_ai:.4f}")
+        console.print(class_table)
+
+        confusion = Table(title="Confusion matrix", box=box.SIMPLE_HEAVY)
+        confusion.add_column("")
+        confusion.add_column("Pred Human", justify="right")
+        confusion.add_column("Pred AI", justify="right")
+        confusion.add_row("True Human", str(result.confusion[0][0]), str(result.confusion[0][1]))
+        confusion.add_row("True AI", str(result.confusion[1][0]), str(result.confusion[1][1]))
+        console.print(confusion)
+        print_info("Full report:")
+        console.print(result.report.rstrip())
+        return
+
     print(f"\n{'='*60}")
     print(f"  {title}")
     print(f"{'='*60}")
@@ -209,23 +243,32 @@ def print_eval_report(result: EvalResult, title: str = "Evaluation Report"):
     print(f"  ROC-AUC:     {result.roc_auc:.4f}")
     print(f"  Threshold:   {result.threshold_used:.3f}")
     print(f"  Opt. thresh: {result.optimal_threshold:.3f}")
-
     print(f"\n  {'':15s} {'Precision':>10s} {'Recall':>10s} {'F1':>10s}")
     print(f"  {'─'*45}")
     print(f"  {'Human':15s} {result.precision_human:10.4f} {result.recall_human:10.4f} {result.f1_human:10.4f}")
     print(f"  {'AI':15s} {result.precision_ai:10.4f} {result.recall_ai:10.4f} {result.f1_ai:10.4f}")
-
     print(f"\n  Confusion Matrix:")
     print(f"  {'':15s} {'Pred Human':>12s} {'Pred AI':>12s}")
     print(f"  {'True Human':15s} {result.confusion[0][0]:12d} {result.confusion[0][1]:12d}")
     print(f"  {'True AI':15s} {result.confusion[1][0]:12d} {result.confusion[1][1]:12d}")
-
     print(f"\n  Full report:\n{result.report}")
     print(f"{'='*60}\n")
 
 
 def print_source_breakdown(breakdowns: list[SourceBreakdown]):
     """Вывод per-source метрик."""
+    if RICH_AVAILABLE:
+        table = Table(title="Per-Source Breakdown", box=box.SIMPLE_HEAVY)
+        table.add_column("Source")
+        table.add_column("N", justify="right")
+        table.add_column("Acc", justify="right")
+        table.add_column("F1", justify="right")
+        table.add_column("AUC", justify="right")
+        for b in breakdowns:
+            table.add_row(b.source, str(b.n_samples), f"{b.accuracy:.3f}", f"{b.f1:.3f}", f"{b.roc_auc:.3f}")
+        console.print(table)
+        return
+
     print(f"\n{'─'*60}")
     print(f"  Per-Source Breakdown")
     print(f"{'─'*60}")

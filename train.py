@@ -37,7 +37,7 @@ from sklearn.metrics import f1_score, precision_recall_curve, roc_auc_score
 from sklearn.model_selection import train_test_split
 
 from model import AITextDetector
-from data import WordTokenizer, TextClassificationDataset, collate_fn
+from data import BPETokenizer, TextClassificationDataset, collate_fn
 
 
 @dataclass
@@ -257,7 +257,7 @@ def train(
     texts: list[str],
     labels: list[int],
     config: TrainConfig | None = None,
-) -> tuple[AITextDetector, WordTokenizer, float]:
+) -> tuple[AITextDetector, BPETokenizer, float]:
     """
     Полный цикл тренировки с PyTorch Lightning.
 
@@ -281,7 +281,7 @@ def train(
         cfg.val_split,
         cfg.seed,
     )
-    tokenizer = WordTokenizer.from_texts(
+    tokenizer = BPETokenizer.from_texts(
         train_texts,
         max_vocab=cfg.max_vocab,
         max_len=cfg.max_len,
@@ -318,6 +318,8 @@ def train(
         dim_feedforward=cfg.dim_feedforward,
         max_len=cfg.max_len,
         dropout=cfg.dropout,
+        pad_idx=tokenizer.pad_idx,
+        unk_idx=tokenizer.unk_idx,
         token_dropout=cfg.token_dropout,
     )
 
@@ -373,7 +375,7 @@ def train(
         if k.startswith("model.")
     }
     torch.save(state_dict, save_dir / "best_model.pt")
-    tokenizer.save(save_dir / "tokenizer.json")
+    tokenizer.save(save_dir / "tokenizer")
     model_config = {
         "vocab_size": tokenizer.vocab_size,
         "d_model": cfg.d_model,
@@ -382,8 +384,8 @@ def train(
         "dim_feedforward": cfg.dim_feedforward,
         "max_len": cfg.max_len,
         "dropout": cfg.dropout,
-        "pad_idx": 0,
-        "unk_idx": 1,
+        "pad_idx": tokenizer.pad_idx,
+        "unk_idx": tokenizer.unk_idx,
         "token_dropout": 0.0,
     }
     (save_dir / "model_config.json").write_text(
