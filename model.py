@@ -3,7 +3,6 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class PositionalEncoding(nn.Module):
@@ -46,10 +45,14 @@ class AITextDetector(nn.Module):
         max_len: int = 512,
         dropout: float = 0.1,
         pad_idx: int = 0,
+        unk_idx: int = 1,
+        token_dropout: float = 0.05,
     ):
         super().__init__()
         self.d_model = d_model
         self.pad_idx = pad_idx
+        self.unk_idx = unk_idx
+        self.token_dropout = token_dropout
 
         # Learnable [CLS] token
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
@@ -69,9 +72,11 @@ class AITextDetector(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.layer_norm = nn.LayerNorm(d_model)
 
-        # Classification head
+        # CLS-only pooling is usually weak when training from scratch, so we
+        # fuse CLS, masked mean, and masked max pooled features.
+        pooled_dim = d_model * 3
         self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(pooled_dim, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model, 1),
@@ -91,6 +96,19 @@ class AITextDetector(nn.Module):
         pad_mask = input_ids == self.pad_idx  # (B, S)
         return torch.cat([cls_mask, pad_mask], dim=1)  # (B, 1+S)
 
+    def _apply_token_dropout(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.token_dropout <= 0:
+            return input_ids
+
+        drop_mask = torch.rand_like(input_ids, dtype=torch.float32) < self.token_dropout
+        drop_mask &= input_ids != self.pad_idx
+        if not torch.any(drop_mask):
+            return input_ids
+
+        dropped = input_ids.clone()
+        dropped[drop_mask] = self.unk_idx
+        return dropped
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -100,6 +118,7 @@ class AITextDetector(nn.Module):
             logits: (batch,) — >0 → AI, <0 → Human
         """
         B = input_ids.size(0)
+        input_ids = self._apply_token_dropout(input_ids)
 
         # Token embeddings + scale
         x = self.embedding(input_ids) * math.sqrt(self.d_model)  # (B, S, D)
@@ -117,7 +136,19 @@ class AITextDetector(nn.Module):
         x = self.transformer(x, src_key_padding_mask=padding_mask)  # (B, 1+S, D)
         x = self.layer_norm(x)
 
-        # [CLS] token representation → classification
+        # Multi-pooling improves signal capture for style classification tasks.
         cls_repr = x[:, 0]  # (B, D)
-        logits = self.head(cls_repr).squeeze(-1)  # (B,)
+        token_repr = x[:, 1:]  # (B, S, D)
+        token_mask = ~padding_mask[:, 1:]  # (B, S)
+        token_mask_f = token_mask.unsqueeze(-1).to(token_repr.dtype)
+
+        denom = token_mask_f.sum(dim=1).clamp_min(1.0)
+        mean_repr = (token_repr * token_mask_f).sum(dim=1) / denom
+
+        masked_tokens = token_repr.masked_fill(~token_mask.unsqueeze(-1), float("-inf"))
+        max_repr = masked_tokens.max(dim=1).values
+        max_repr = torch.where(torch.isfinite(max_repr), max_repr, torch.zeros_like(max_repr))
+
+        pooled = torch.cat([cls_repr, mean_repr, max_repr], dim=-1)
+        logits = self.head(pooled).squeeze(-1)  # (B,)
         return logits

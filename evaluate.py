@@ -20,7 +20,6 @@ from sklearn.metrics import (
     f1_score,
     precision_recall_curve,
     roc_auc_score,
-    roc_curve,
 )
 
 from model import AITextDetector
@@ -42,6 +41,7 @@ class EvalResult:
     recall_ai: float
     roc_auc: float
     confusion: np.ndarray          # 2×2
+    threshold_used: float
     optimal_threshold: float       # порог с лучшим F1
     report: str                    # sklearn classification_report
 
@@ -53,6 +53,7 @@ def evaluate_model(
     labels: Sequence[int],
     batch_size: int = 32,
     device: str = "auto",
+    threshold: float = 0.5,
 ) -> EvalResult:
     """
     Полная оценка модели на тестовых данных.
@@ -64,6 +65,7 @@ def evaluate_model(
         labels: 0=human, 1=AI
         batch_size: размер батча
         device: "auto", "cpu", "cuda"
+        threshold: порог для положительного класса (AI)
 
     Returns:
         EvalResult с полным набором метрик
@@ -97,24 +99,25 @@ def evaluate_model(
     best_idx = np.argmax(f1_vals)
     optimal_threshold = float(thresholds_pr[best_idx]) if best_idx < len(thresholds_pr) else 0.5
 
-    # ── Predictions at default threshold (0.5) ───────────────────────────
-    preds_default = (probs >= 0.5).astype(int)
-
-    # ── Predictions at optimal threshold ─────────────────────────────────
-    preds_optimal = (probs >= optimal_threshold).astype(int)
+    # ── Predictions at configured threshold ───────────────────────────────
+    preds_threshold = (probs >= threshold).astype(int)
 
     # ── Метрики ──────────────────────────────────────────────────────────
     target_names = ["Human", "AI"]
 
     report = classification_report(
-        labels_arr, preds_default, target_names=target_names, digits=4
+        labels_arr,
+        preds_threshold,
+        target_names=target_names,
+        digits=4,
+        zero_division=0,
     )
-    cm = confusion_matrix(labels_arr, preds_default)
+    cm = confusion_matrix(labels_arr, preds_threshold)
 
-    f1_per_class = f1_score(labels_arr, preds_default, average=None)
+    f1_per_class = f1_score(labels_arr, preds_threshold, average=None)
     from sklearn.metrics import precision_score, recall_score
-    prec_per_class = precision_score(labels_arr, preds_default, average=None)
-    rec_per_class = recall_score(labels_arr, preds_default, average=None)
+    prec_per_class = precision_score(labels_arr, preds_threshold, average=None, zero_division=0)
+    rec_per_class = recall_score(labels_arr, preds_threshold, average=None, zero_division=0)
 
     try:
         auc = roc_auc_score(labels_arr, probs)
@@ -122,8 +125,8 @@ def evaluate_model(
         auc = 0.0  # если только один класс
 
     return EvalResult(
-        accuracy=accuracy_score(labels_arr, preds_default),
-        f1=f1_score(labels_arr, preds_default, average="macro"),
+        accuracy=accuracy_score(labels_arr, preds_threshold),
+        f1=f1_score(labels_arr, preds_threshold, average="macro"),
         f1_human=float(f1_per_class[0]),
         f1_ai=float(f1_per_class[1]) if len(f1_per_class) > 1 else 0.0,
         precision_human=float(prec_per_class[0]),
@@ -132,6 +135,7 @@ def evaluate_model(
         recall_ai=float(rec_per_class[1]) if len(rec_per_class) > 1 else 0.0,
         roc_auc=auc,
         confusion=cm,
+        threshold_used=threshold,
         optimal_threshold=optimal_threshold,
         report=report,
     )
@@ -203,6 +207,7 @@ def print_eval_report(result: EvalResult, title: str = "Evaluation Report"):
     print(f"\n  Accuracy:    {result.accuracy:.4f}")
     print(f"  F1 (macro):  {result.f1:.4f}")
     print(f"  ROC-AUC:     {result.roc_auc:.4f}")
+    print(f"  Threshold:   {result.threshold_used:.3f}")
     print(f"  Opt. thresh: {result.optimal_threshold:.3f}")
 
     print(f"\n  {'':15s} {'Precision':>10s} {'Recall':>10s} {'F1':>10s}")

@@ -8,6 +8,10 @@
   • Human-vs-AI    — dmitva/human_ai_generated_text (human vs AI essays)
   • AI-Human-Mixed — Ateeqq/AI-and-Human-Generated-Text (GPT-4 + BARD)
   • HC3            — Hello-SimpleAI/HC3 (Human vs ChatGPT, multi-domain)
+  • CoAT / RuATD   — RussianNLP/coat (ruatd = compatibility alias)
+  • gsingh train   — gsingh1-py/train (human stories + multiple LLM outputs)
+  • DAIGT Proper   — Kaggle DAIGT v2 / local export fallback
+  • M-DAIGT        — local export of the shared-task dataset
 
 Использование:
     from dataset_loader import load_combined_dataset, DatasetConfig
@@ -16,9 +20,15 @@
 
 from __future__ import annotations
 
+import csv
+import json
+import os
 import random
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Iterator
 
 from datasets import load_dataset
@@ -60,9 +70,26 @@ class DatasetConfig:
     # Воспроизводимость
     seed: int = 42
 
+    # Пути к локальным источникам, если датасет не доступен напрямую через HF.
+    # Пример: {"daigt_proper": "/path/to/train.csv", "m_daigt": "/path/to/data_dir"}
+    source_paths: dict[str, str] = field(default_factory=dict)
+    cache_dir: str = ".cache/datasets"
+    auto_download_kaggle: bool = True
+
     # Список всех доступных источников
     available_sources: list[str] = field(default_factory=lambda: [
-        "raid", "ai_pile", "gpt_wiki", "human_vs_ai", "ai_human_mixed", "hc3",
+        "raid",
+        "ai_pile",
+        "gpt_wiki",
+        "human_vs_ai",
+        "ai_human_mixed",
+        "hc3",
+        "coat",
+        "ruatd",
+        "daigt_proper",
+        "daigt_v2",
+        "m_daigt",
+        "gsingh_train",
     ])
 
 
@@ -75,9 +102,265 @@ class LoadResult:
     stats: dict
 
 
+_LOCAL_SOURCE_ENV_VARS = {
+    "daigt_proper": "DAIGT_PROPER_PATH",
+    "daigt_v2": "DAIGT_PROPER_PATH",
+    "m_daigt": "M_DAIGT_PATH",
+}
+
+_SUPPORTED_LOCAL_SUFFIXES = {".csv", ".tsv", ".jsonl", ".json", ".parquet"}
+_KAGGLE_DATASETS = {
+    "daigt_proper": "thedrcat/daigt-v2-train-dataset",
+    "daigt_v2": "thedrcat/daigt-v2-train-dataset",
+}
+
+
+def _clean_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+        return "\n".join(parts)
+    return str(value).strip()
+
+
+def _normalized_row(row: dict) -> dict[str, object]:
+    return {
+        str(key).strip().lower(): value
+        for key, value in row.items()
+        if key is not None
+    }
+
+
+def _first_present(row: dict, *candidates: str):
+    normalized = _normalized_row(row)
+    for candidate in candidates:
+        value = normalized.get(candidate.lower())
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def _parse_label(value) -> Label | None:
+    if isinstance(value, Label):
+        return value
+    if isinstance(value, bool):
+        return Label.AI if value else Label.HUMAN
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if int(value) == 1:
+            return Label.AI
+        if int(value) == 0:
+            return Label.HUMAN
+        return None
+
+    text = _clean_text(value).lower()
+    if not text:
+        return None
+
+    if text in {"1", "ai", "generated", "machine-generated", "ai-generated", "m", "true", "yes"}:
+        return Label.AI
+    if text in {"0", "human", "written", "human-written", "original", "h", "false", "no"}:
+        return Label.HUMAN
+    return None
+
+
+def _download_kaggle_dataset(source_name: str, cfg: DatasetConfig) -> Path:
+    dataset_slug = _KAGGLE_DATASETS[source_name]
+    cache_root = Path(cfg.cache_dir).expanduser()
+    target_dir = cache_root / source_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_files = list(target_dir.rglob("*"))
+    if any(path.is_file() and path.suffix.lower() in _SUPPORTED_LOCAL_SUFFIXES for path in existing_files):
+        return target_dir
+
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+    except ModuleNotFoundError:
+        KaggleApi = None
+
+    if KaggleApi is not None:
+        try:
+            api = KaggleApi()
+            api.authenticate()
+            api.dataset_download_files(dataset_slug, path=str(target_dir), unzip=True, quiet=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to download the Kaggle dataset. "
+                "Set KAGGLE_USERNAME and KAGGLE_KEY or provide a local source path."
+            ) from exc
+        return target_dir
+
+    kaggle_exe = shutil.which("kaggle")
+    if kaggle_exe:
+        try:
+            subprocess.run(
+                [
+                    kaggle_exe,
+                    "datasets",
+                    "download",
+                    "-d",
+                    dataset_slug,
+                    "-p",
+                    str(target_dir),
+                    "--unzip",
+                ],
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "Failed to download the Kaggle dataset with the CLI. "
+                "Check your Kaggle credentials or provide a local source path."
+            ) from exc
+        return target_dir
+
+    raise RuntimeError(
+        "Kaggle auto-download requested but neither the kaggle package nor CLI is installed."
+    )
+
+
+def _resolve_local_source_path(source_name: str, cfg: DatasetConfig) -> Path:
+    env_name = _LOCAL_SOURCE_ENV_VARS.get(source_name)
+    raw_path = cfg.source_paths.get(source_name) or (os.getenv(env_name) if env_name else None)
+    if not raw_path and cfg.auto_download_kaggle and source_name in _KAGGLE_DATASETS:
+        return _download_kaggle_dataset(source_name, cfg)
+    if not raw_path:
+        raise FileNotFoundError(
+            f"{source_name} requires a local export. "
+            f"Pass DatasetConfig(source_paths={{'{source_name}': '/path'}})"
+            + (f" or set ${env_name}." if env_name else ".")
+        )
+
+    path = Path(raw_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Configured path for {source_name} does not exist: {path}")
+    return path
+
+
+def _iter_local_rows(path: Path) -> Iterator[tuple[dict, Path]]:
+    if path.is_file():
+        files = [path]
+    else:
+        files = sorted(
+            p for p in path.rglob("*")
+            if p.is_file() and p.suffix.lower() in _SUPPORTED_LOCAL_SUFFIXES
+        )
+
+    if not files:
+        raise FileNotFoundError(f"No supported data files found in {path}")
+
+    for file_path in files:
+        suffix = file_path.suffix.lower()
+        if suffix in {".csv", ".tsv"}:
+            delimiter = "\t" if suffix == ".tsv" else ","
+            with file_path.open(encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle, delimiter=delimiter)
+                for row in reader:
+                    yield row, file_path
+            continue
+
+        if suffix == ".jsonl":
+            with file_path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    if isinstance(row, dict):
+                        yield row, file_path
+            continue
+
+        if suffix == ".json":
+            with file_path.open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, list):
+                for row in payload:
+                    if isinstance(row, dict):
+                        yield row, file_path
+            elif isinstance(payload, dict):
+                for value in payload.values():
+                    if isinstance(value, list):
+                        for row in value:
+                            if isinstance(row, dict):
+                                yield row, file_path
+            continue
+
+        if suffix == ".parquet":
+            ds = load_dataset("parquet", data_files=str(file_path), split="train", streaming=True)
+            for row in ds:
+                yield row, file_path
+
+
+def _infer_domain(source_name: str, row: dict, file_path: Path) -> str:
+    domain = _first_present(
+        row,
+        "domain",
+        "subtask",
+        "task",
+        "category",
+        "dataset",
+        "source_dataset",
+        "source_domain",
+    )
+    if domain is not None:
+        return _clean_text(domain) or "unknown"
+
+    path_hint = file_path.as_posix().lower()
+    if "academic" in path_hint or "paper" in path_hint:
+        return "academic"
+    if "news" in path_hint or "article" in path_hint:
+        return "news"
+    if source_name == "daigt_proper":
+        return "essays"
+    if source_name == "m_daigt":
+        return "multi_domain"
+    return "unknown"
+
+
+def _iter_local_labeled_dataset(
+    source_name: str,
+    max_samples: int,
+    cfg: DatasetConfig,
+    *,
+    text_fields: tuple[str, ...],
+    label_fields: tuple[str, ...],
+    generator_fields: tuple[str, ...] = (),
+) -> Iterator[Sample]:
+    path = _resolve_local_source_path(source_name, cfg)
+    count = 0
+    for row, file_path in _iter_local_rows(path):
+        text = _clean_text(_first_present(row, *text_fields))
+        if not text:
+            continue
+
+        label = _parse_label(_first_present(row, *label_fields))
+        if label is None:
+            continue
+
+        generator = _clean_text(_first_present(row, *generator_fields))
+        if not generator:
+            generator = "human" if label == Label.HUMAN else "unknown"
+
+        yield Sample(
+            text=text,
+            label=label,
+            source_dataset=source_name,
+            generator=generator,
+            domain=_infer_domain(source_name, row, file_path),
+        )
+        count += 1
+        if count >= max_samples:
+            return
+
+
 # ─── Адаптеры для каждого датасета ────────────────────────────────────────────
 
-def _iter_raid(max_samples: int) -> Iterator[Sample]:
+def _iter_raid(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
     """
     RAID: liamdugan/raid
     Самый большой бенчмарк: 11 LLM, 8 доменов, атаки на детекторы.
@@ -102,7 +385,7 @@ def _iter_raid(max_samples: int) -> Iterator[Sample]:
             return
 
 
-def _iter_ai_pile(max_samples: int) -> Iterator[Sample]:
+def _iter_ai_pile(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
     """
     artem9k/ai-text-detection-pile
     Long-form essays: human, GPT-2, GPT-3, ChatGPT, GPT-J.
@@ -126,7 +409,7 @@ def _iter_ai_pile(max_samples: int) -> Iterator[Sample]:
             return
 
 
-def _iter_gpt_wiki(max_samples: int) -> Iterator[Sample]:
+def _iter_gpt_wiki(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
     """
     aadityaubhat/GPT-wiki-intro
     Paired: Wikipedia intro (human) vs GPT-3 generated intro.
@@ -163,7 +446,7 @@ def _iter_gpt_wiki(max_samples: int) -> Iterator[Sample]:
                 return
 
 
-def _iter_human_vs_ai(max_samples: int) -> Iterator[Sample]:
+def _iter_human_vs_ai(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
     """
     dmitva/human_ai_generated_text
     Paired: human essays vs AI-generated essays.
@@ -199,7 +482,7 @@ def _iter_human_vs_ai(max_samples: int) -> Iterator[Sample]:
                 return
 
 
-def _iter_ai_human_mixed(max_samples: int) -> Iterator[Sample]:
+def _iter_ai_human_mixed(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
     """
     Ateeqq/AI-and-Human-Generated-Text
     GPT-4, BARD и human тексты разных жанров.
@@ -224,7 +507,7 @@ def _iter_ai_human_mixed(max_samples: int) -> Iterator[Sample]:
             return
 
 
-def _iter_hc3(max_samples: int) -> Iterator[Sample]:
+def _iter_hc3(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
     """
     HC3: Hello-SimpleAI/HC3
     Human vs ChatGPT answers across domains (ELI5, finance, medicine, wiki, open QA).
@@ -273,6 +556,128 @@ def _iter_hc3(max_samples: int) -> Iterator[Sample]:
                         return
 
 
+def _iter_coat(max_samples: int, cfg: DatasetConfig | None = None, source_name: str = "coat") -> Iterator[Sample]:
+    """
+    CoAT: RussianNLP/coat
+    Public binary subset for Russian AI-text detection.
+    """
+    ds = load_dataset("RussianNLP/coat", "binary", split="train", streaming=True)
+    count = 0
+    for row in ds:
+        text = _clean_text(row.get("text"))
+        label = _parse_label(row.get("label"))
+        if not text or label is None:
+            continue
+
+        yield Sample(
+            text=text,
+            label=label,
+            source_dataset=source_name,
+            generator="human" if label == Label.HUMAN else "unknown_ru_model",
+            domain=_clean_text(row.get("domain")) or "russian",
+        )
+        count += 1
+        if count >= max_samples:
+            return
+
+
+def _iter_ruatd(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
+    """
+    RuATD now points to CoAT as the public extended corpus, so this source is
+    provided as a compatibility alias over the CoAT binary split.
+    """
+    yield from _iter_coat(max_samples, cfg, source_name="ruatd")
+
+
+def _iter_gsingh_train(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
+    """
+    gsingh1-py/train
+    One human story plus several model-generated variants per prompt.
+    """
+    ds = load_dataset("gsingh1-py/train", split="train", streaming=True)
+    count = 0
+    ai_columns = [
+        "gemma-2-9b",
+        "mistral-7B",
+        "qwen-2-72B",
+        "llama-8B",
+        "accounts/yi-01-ai/models/yi-large",
+        "GPT_4-o",
+    ]
+
+    for row in ds:
+        human_text = _clean_text(row.get("Human_story"))
+        if human_text:
+            yield Sample(
+                text=human_text,
+                label=Label.HUMAN,
+                source_dataset="gsingh_train",
+                generator="human",
+                domain="stories",
+            )
+            count += 1
+            if count >= max_samples:
+                return
+
+        for column in ai_columns:
+            ai_text = _clean_text(row.get(column))
+            if not ai_text:
+                continue
+            yield Sample(
+                text=ai_text,
+                label=Label.AI,
+                source_dataset="gsingh_train",
+                generator=column,
+                domain="stories",
+            )
+            count += 1
+            if count >= max_samples:
+                return
+
+
+def _iter_daigt_proper(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
+    """
+    thedrcat/daigt-v2-train-dataset
+    Kaggle dataset, auto-downloaded when credentials are available, or read from
+    a local CSV/JSON/Parquet export.
+    """
+    yield from _iter_local_labeled_dataset(
+        "daigt_proper",
+        max_samples,
+        cfg or DatasetConfig(),
+        text_fields=("text", "essay", "essay_text", "content"),
+        label_fields=("label", "generated", "is_ai", "target", "generated_text"),
+        generator_fields=("source", "model", "generator"),
+    )
+
+
+def _iter_daigt_v2(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
+    yield from _iter_local_labeled_dataset(
+        "daigt_v2",
+        max_samples,
+        cfg or DatasetConfig(),
+        text_fields=("text", "essay", "essay_text", "content"),
+        label_fields=("label", "generated", "is_ai", "target", "generated_text"),
+        generator_fields=("source", "model", "generator"),
+    )
+
+
+def _iter_m_daigt(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
+    """
+    M-DAIGT shared-task dataset.
+    The public repo contains documentation, while the actual rows are expected
+    from a local export directory or file.
+    """
+    yield from _iter_local_labeled_dataset(
+        "m_daigt",
+        max_samples,
+        cfg or DatasetConfig(),
+        text_fields=("text", "article", "content", "body", "snippet", "document"),
+        label_fields=("label", "generated", "is_ai", "target", "class"),
+        generator_fields=("generator", "model", "llm", "source_model"),
+    )
+
+
 # ─── Registry ─────────────────────────────────────────────────────────────────
 
 _SOURCE_REGISTRY: dict[str, callable] = {
@@ -282,6 +687,13 @@ _SOURCE_REGISTRY: dict[str, callable] = {
     "human_vs_ai": _iter_human_vs_ai,
     "ai_human_mixed": _iter_ai_human_mixed,
     "hc3": _iter_hc3,
+    "coat": _iter_coat,
+    "ruatd": _iter_ruatd,
+    "daigt_proper": _iter_daigt_proper,
+    "daigt_v2": _iter_daigt_v2,
+    "m_daigt": _iter_m_daigt,
+    "gsingh_train": _iter_gsingh_train,
+    "gsingh1_train": _iter_gsingh_train,
 }
 
 
@@ -313,7 +725,7 @@ def load_combined_dataset(config: DatasetConfig | None = None) -> LoadResult:
         src_samples: list[Sample] = []
 
         try:
-            for sample in loader(cfg.max_per_source):
+            for sample in loader(cfg.max_per_source, cfg):
                 # Фильтр по длине
                 if len(sample.text) < cfg.min_text_length:
                     continue
@@ -405,11 +817,24 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Загрузка комбинированного датасета")
     parser.add_argument("--sources", nargs="+", default=None, help="Источники данных")
+    parser.add_argument(
+        "--source-path",
+        action="append",
+        default=[],
+        help="Локальный путь в формате source=/abs/path. Нужен для daigt_proper и m_daigt.",
+    )
     parser.add_argument("--max-per-source", type=int, default=5_000)
     parser.add_argument("--max-total", type=int, default=20_000)
     parser.add_argument("--no-balance", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    source_paths = {}
+    for item in args.source_path:
+        if "=" not in item:
+            raise ValueError(f"Неверный --source-path: {item}. Ожидается source=/path")
+        source_name, path = item.split("=", 1)
+        source_paths[source_name.strip()] = path.strip()
 
     cfg = DatasetConfig(
         sources=args.sources,
@@ -417,6 +842,7 @@ if __name__ == "__main__":
         max_total=args.max_total,
         balance_labels=not args.no_balance,
         seed=args.seed,
+        source_paths=source_paths,
     )
 
     result = load_combined_dataset(cfg)

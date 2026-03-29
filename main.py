@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import argparse
-import random
+from collections import Counter
+
+from sklearn.model_selection import train_test_split
 
 from dataset_loader import load_combined_dataset, DatasetConfig
 from train import train, TrainConfig
@@ -28,7 +30,13 @@ def parse_args() -> argparse.Namespace:
 
     # Data
     p.add_argument("--sources", nargs="+", default=None,
-                   help="raid, ai_pile, gpt_wiki, human_vs_ai, ai_human_mixed, hc3")
+                   help="raid, ai_pile, gpt_wiki, human_vs_ai, ai_human_mixed, hc3, coat, ruatd, daigt_proper, daigt_v2, m_daigt, gsingh_train")
+    p.add_argument(
+        "--source-path",
+        action="append",
+        default=[],
+        help="Optional local source path in the form source=/abs/path. Needed for daigt_proper and m_daigt.",
+    )
     p.add_argument("--max-per-source", type=int, default=5_000)
     p.add_argument("--max-total", type=int, default=20_000)
     p.add_argument("--min-text-len", type=int, default=50)
@@ -52,16 +60,51 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def parse_source_paths(items: list[str]) -> dict[str, str]:
+    source_paths: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"Invalid --source-path value: {item}. Expected source=/path.")
+        source_name, path = item.split("=", 1)
+        source_name = source_name.strip()
+        path = path.strip()
+        if not source_name or not path:
+            raise ValueError(f"Invalid --source-path value: {item}. Expected source=/path.")
+        source_paths[source_name] = path
+    return source_paths
+
+
 def split_data(result, test_ratio: float, seed: int):
     """Train/test split с сохранением метаданных сэмплов."""
-    rng = random.Random(seed)
     indices = list(range(len(result.texts)))
-    rng.shuffle(indices)
+    stratify = None
 
-    split_idx = int(len(indices) * (1 - test_ratio))
+    source_label_groups = [
+        f"{result.samples[i].source_dataset}:{result.labels[i]}"
+        for i in indices
+    ]
+    group_counts = Counter(source_label_groups)
+    if group_counts and min(group_counts.values()) >= 2:
+        stratify = source_label_groups
+    else:
+        label_counts = Counter(result.labels)
+        if label_counts and min(label_counts.values()) >= 2:
+            stratify = result.labels
 
-    train_idx = indices[:split_idx]
-    test_idx = indices[split_idx:]
+    try:
+        train_idx, test_idx = train_test_split(
+            indices,
+            test_size=test_ratio,
+            random_state=seed,
+            stratify=stratify,
+        )
+    except ValueError:
+        train_idx, test_idx = train_test_split(
+            indices,
+            test_size=test_ratio,
+            random_state=seed,
+            stratify=None,
+        )
 
     train_texts = [result.texts[i] for i in train_idx]
     train_labels = [result.labels[i] for i in train_idx]
@@ -74,6 +117,7 @@ def split_data(result, test_ratio: float, seed: int):
 
 def main():
     args = parse_args()
+    source_paths = parse_source_paths(args.source_path)
 
     # ── 1. Загрузка данных ───────────────────────────────────────────────
     print("=" * 60)
@@ -88,6 +132,7 @@ def main():
         max_text_length=args.max_text_len,
         balance_labels=True,
         seed=args.seed,
+        source_paths=source_paths,
     )
 
     result = load_combined_dataset(data_cfg)
@@ -116,7 +161,7 @@ def main():
         seed=args.seed,
     )
 
-    model, tokenizer = train(train_texts, train_labels, train_cfg)
+    model, tokenizer, threshold = train(train_texts, train_labels, train_cfg)
 
     # ── 3. Оценка на тестовой выборке ────────────────────────────────────
     print("\n" + "=" * 60)
@@ -126,11 +171,12 @@ def main():
     eval_result = evaluate_model(
         model, tokenizer, test_texts, test_labels,
         batch_size=args.batch_size,
+        threshold=threshold,
     )
     print_eval_report(eval_result, title="Test Set Evaluation")
 
     # ── 4. Per-source breakdown ──────────────────────────────────────────
-    detector = Detector(model, tokenizer)
+    detector = Detector(model, tokenizer, threshold=threshold)
     breakdowns = evaluate_per_source(detector, test_samples)
     if breakdowns:
         print_source_breakdown(breakdowns)
@@ -163,6 +209,7 @@ def main():
 
     print(f"\n  Live accuracy: {correct}/{len(examples)}")
     print(f"\n  Model saved to: checkpoints/")
+    print(f"  Threshold: {threshold:.3f}")
     print(f"  Usage:")
     print(f"    from inference import Detector")
     print(f"    detector = Detector.from_checkpoint('checkpoints/')")

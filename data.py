@@ -17,6 +17,7 @@ from torch.nn.utils.rnn import pad_sequence
 # ─── Tokenizer ────────────────────────────────────────────────────────────────
 
 SPECIAL_TOKENS = {"[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3}
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*|[^\w\s]")
 
 
 @dataclass
@@ -51,10 +52,12 @@ class WordTokenizer:
     # ── Encode / Decode ──────────────────────────────────────────────────
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        return re.findall(r"\w+|[^\w\s]", text.lower())
+        return TOKEN_PATTERN.findall(text.lower())
 
     def encode(self, text: str) -> list[int]:
         tokens = self._tokenize(text)[: self.max_len]
+        if not tokens:
+            tokens = ["[UNK]"]
         unk = self.word2idx["[UNK]"]
         return [self.word2idx.get(t, unk) for t in tokens]
 

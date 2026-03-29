@@ -1,0 +1,4 @@
+# Put one text per line, or separate longer texts with a blank line.
+# Lines starting with # are ignored.
+
+This sentence is a short example for running the detector.
