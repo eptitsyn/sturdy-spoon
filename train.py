@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 import math
@@ -38,6 +39,12 @@ from sklearn.model_selection import train_test_split
 
 from model import AITextDetector
 from data import BPETokenizer, StylometricVectorizer, TextClassificationDataset, collate_fn
+from ui import RICH_AVAILABLE, print_info, spinner_status
+
+try:
+    from pytorch_lightning.callbacks import RichProgressBar
+except ImportError:  # pragma: no cover - depends on lightning extras
+    RichProgressBar = None
 
 
 @dataclass
@@ -286,12 +293,16 @@ def train(
         cfg.val_split,
         cfg.seed,
     )
-    tokenizer = BPETokenizer.from_texts(
-        train_texts,
-        max_vocab=cfg.max_vocab,
-        max_len=cfg.max_len,
-    )
-    stylometric_vectorizer = StylometricVectorizer.fit(train_texts)
+    print_info("Building tokenizer...")
+    with spinner_status("Training BPE tokenizer (compute merges may take a while)..."):
+        tokenizer = BPETokenizer.from_texts(
+            train_texts,
+            max_vocab=cfg.max_vocab,
+            max_len=cfg.max_len,
+        )
+    print_info("Building stylometric features...")
+    with spinner_status("Fitting stylometric feature statistics..."):
+        stylometric_vectorizer = StylometricVectorizer.fit(train_texts)
     train_ds = TextClassificationDataset(train_texts, train_labels, tokenizer, stylometric_vectorizer)
     val_ds = TextClassificationDataset(val_texts, val_labels, tokenizer, stylometric_vectorizer)
 
@@ -357,11 +368,14 @@ def train(
         mode="max",
         patience=cfg.patience,
     )
+    callbacks = [checkpoint_cb, early_stopping_cb]
+    if RICH_AVAILABLE and RichProgressBar is not None:
+        callbacks.append(RichProgressBar())
 
     use_amp = cfg.use_amp and torch.cuda.is_available()
     trainer = pl.Trainer(
         max_epochs=cfg.epochs,
-        callbacks=[checkpoint_cb, early_stopping_cb],
+        callbacks=callbacks,
         precision="16-mixed" if use_amp else "32-true",
         enable_progress_bar=True,
         log_every_n_steps=10,

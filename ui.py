@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 try:
     from rich import box
     from rich.console import Console
@@ -62,3 +64,8 @@ def print_warning(message: str) -> None:
         return
     print(message)
 
+
+def spinner_status(message: str):
+    if RICH_AVAILABLE:
+        return console.status(message)
+    return nullcontext()
