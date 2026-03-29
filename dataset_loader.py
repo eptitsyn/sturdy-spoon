@@ -115,7 +115,7 @@ _KAGGLE_DATASETS = {
     "daigt_proper": "thedrcat/daigt-v2-train-dataset",
     "daigt_v2": "thedrcat/daigt-v2-train-dataset",
 }
-_SOURCE_CACHE_SCHEMA_VERSION = 2
+_SOURCE_CACHE_SCHEMA_VERSION = 4
 _SOURCE_ALIASES = {
     "ruatd": "coat",
     "daigt_v2": "daigt_proper",
@@ -414,9 +414,18 @@ def _iter_local_labeled_dataset(
     text_fields: tuple[str, ...],
     label_fields: tuple[str, ...],
     generator_fields: tuple[str, ...] = (),
+    balance_binary_labels: bool = False,
 ) -> Iterator[Sample]:
     path = _resolve_local_source_path(source_name, cfg)
-    count = 0
+    if balance_binary_labels:
+        rng = random.Random(cfg.seed)
+        target_human = max_samples // 2
+        target_ai = max_samples - target_human
+        humans: list[Sample] = []
+        ais: list[Sample] = []
+    else:
+        count = 0
+
     for row, file_path in _iter_local_rows(path):
         text = _clean_text(_first_present(row, *text_fields))
         if not text:
@@ -430,16 +439,35 @@ def _iter_local_labeled_dataset(
         if not generator:
             generator = "human" if label == Label.HUMAN else "unknown"
 
-        yield Sample(
+        sample = Sample(
             text=text,
             label=label,
             source_dataset=source_name,
             generator=generator,
             domain=_infer_domain(source_name, row, file_path),
         )
+        if balance_binary_labels:
+            if sample.label == Label.HUMAN:
+                if len(humans) < target_human:
+                    humans.append(sample)
+            else:
+                if len(ais) < target_ai:
+                    ais.append(sample)
+
+            if len(humans) >= target_human and len(ais) >= target_ai:
+                break
+            continue
+
+        yield sample
         count += 1
         if count >= max_samples:
             return
+
+    if balance_binary_labels:
+        samples = humans + ais
+        rng.shuffle(samples)
+        for sample in samples[:max_samples]:
+            yield sample
 
 
 # ─── Адаптеры для каждого датасета ────────────────────────────────────────────
@@ -476,23 +504,40 @@ def _iter_ai_pile(max_samples: int, cfg: DatasetConfig | None = None) -> Iterato
     """
     seed = (cfg.seed if cfg is not None else 42)
     ds = load_dataset("artem9k/ai-text-detection-pile", split="train", streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=min(max_samples * 4, 20_000))
-    count = 0
+    ds = ds.shuffle(seed=seed, buffer_size=min(max_samples * 8, 50_000))
+    rng = random.Random(seed)
+    target_human = max_samples // 2
+    target_ai = max_samples - target_human
+    humans: list[Sample] = []
+    ais: list[Sample] = []
+
     for row in ds:
         text = (row.get("text") or "").strip()
         if not text:
             continue
         source = _clean_text(row.get("source")).lower() or "unknown"
-        yield Sample(
+        sample = Sample(
             text=text,
             label=Label.HUMAN if source == "human" else Label.AI,
             source_dataset="ai_pile",
             generator=source,
             domain="essays",
         )
-        count += 1
-        if count >= max_samples:
-            return
+
+        if sample.label == Label.HUMAN:
+            if len(humans) < target_human:
+                humans.append(sample)
+        else:
+            if len(ais) < target_ai:
+                ais.append(sample)
+
+        if len(humans) >= target_human and len(ais) >= target_ai:
+            break
+
+    samples = humans + ais
+    rng.shuffle(samples)
+    for sample in samples[:max_samples]:
+        yield sample
 
 
 def _iter_gpt_wiki(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sample]:
@@ -734,6 +779,7 @@ def _iter_daigt_proper(max_samples: int, cfg: DatasetConfig | None = None) -> It
         text_fields=("text", "essay", "essay_text", "content"),
         label_fields=("#label", "label", "generated", "is_ai", "target", "generated_text"),
         generator_fields=("source", "model", "generator"),
+        balance_binary_labels=True,
     )
 
 
@@ -745,6 +791,7 @@ def _iter_daigt_v2(max_samples: int, cfg: DatasetConfig | None = None) -> Iterat
         text_fields=("text", "essay", "essay_text", "content"),
         label_fields=("#label", "label", "generated", "is_ai", "target", "generated_text"),
         generator_fields=("source", "model", "generator"),
+        balance_binary_labels=True,
     )
 
 
