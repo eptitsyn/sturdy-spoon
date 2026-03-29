@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import nullcontext
 from itertools import islice
 from pathlib import Path
 
@@ -19,7 +20,21 @@ from dataset_loader import (
     _raw_source_dir,
     _resolve_local_source_path,
 )
-from ui import RICH_AVAILABLE, Table, box, console, print_info, print_section, print_warning
+from ui import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    RICH_AVAILABLE,
+    SpinnerColumn,
+    Table,
+    TextColumn,
+    TimeElapsedColumn,
+    box,
+    console,
+    print_info,
+    print_section,
+    print_warning,
+)
 
 
 INTERESTING_RAW_FIELDS = (
@@ -267,12 +282,31 @@ def inspect_source(source_name: str, cfg: DatasetConfig, args: argparse.Namespac
     domain_counts = Counter(_clean_text(sample.domain) or "unknown" for sample in samples)
     text_lengths = [len(sample.text) for sample in samples]
     issues = []
-    for sample in samples:
-        issue = _sample_issue(source_name, sample)
-        if issue is not None:
-            issues.append((issue, sample))
-            if len(issues) >= 10:
-                break
+    progress_context = (
+        Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        )
+        if RICH_AVAILABLE
+        else nullcontext()
+    )
+    with progress_context as progress:
+        task_id = progress.add_task(f"Validating {source_name}", total=len(samples)) if RICH_AVAILABLE else None
+        for sample in samples:
+            issue = _sample_issue(source_name, sample)
+            if issue is not None:
+                issues.append((issue, sample))
+                if len(issues) >= 10:
+                    if RICH_AVAILABLE:
+                        progress.advance(task_id)
+                    break
+            if RICH_AVAILABLE:
+                progress.advance(task_id)
 
     print_info(f"Loaded {len(samples):,} samples")
     print_info(
@@ -330,8 +364,25 @@ def main() -> None:
     if not sources:
         raise SystemExit("No valid sources selected.")
 
-    for source_name in sources:
-        inspect_source(source_name, cfg, args)
+    progress_context = (
+        Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        )
+        if RICH_AVAILABLE
+        else nullcontext()
+    )
+    with progress_context as progress:
+        task_id = progress.add_task("Validating datasets", total=len(sources)) if RICH_AVAILABLE else None
+        for source_name in sources:
+            inspect_source(source_name, cfg, args)
+            if RICH_AVAILABLE:
+                progress.advance(task_id)
 
 
 if __name__ == "__main__":

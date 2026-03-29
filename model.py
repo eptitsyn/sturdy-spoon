@@ -47,12 +47,14 @@ class AITextDetector(nn.Module):
         pad_idx: int = 0,
         unk_idx: int = 1,
         token_dropout: float = 0.05,
+        stylometric_dim: int = 0,
     ):
         super().__init__()
         self.d_model = d_model
         self.pad_idx = pad_idx
         self.unk_idx = unk_idx
         self.token_dropout = token_dropout
+        self.stylometric_dim = stylometric_dim
 
         # Learnable [CLS] token
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
@@ -85,6 +87,15 @@ class AITextDetector(nn.Module):
         # CLS-only pooling is usually weak when training from scratch, so we
         # fuse CLS, masked mean, and masked max pooled features.
         pooled_dim = d_model * 3
+        if stylometric_dim > 0:
+            self.stylometric_projector = nn.Sequential(
+                nn.Linear(stylometric_dim, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            pooled_dim += d_model
+        else:
+            self.stylometric_projector = None
         self.head = nn.Sequential(
             nn.Linear(pooled_dim, d_model),
             nn.GELU(),
@@ -119,7 +130,11 @@ class AITextDetector(nn.Module):
         dropped[drop_mask] = self.unk_idx
         return dropped
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        stylometric_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
             input_ids: (batch, seq_len) — token ids
@@ -160,5 +175,24 @@ class AITextDetector(nn.Module):
         max_repr = torch.where(torch.isfinite(max_repr), max_repr, torch.zeros_like(max_repr))
 
         pooled = torch.cat([cls_repr, mean_repr, max_repr], dim=-1)
+        if self.stylometric_projector is not None:
+            if stylometric_features is None:
+                stylometric_features = torch.zeros(
+                    B,
+                    self.stylometric_dim,
+                    device=pooled.device,
+                    dtype=pooled.dtype,
+                )
+            if stylometric_features.ndim == 1:
+                stylometric_features = stylometric_features.unsqueeze(0)
+            if stylometric_features.size(-1) != self.stylometric_dim:
+                raise ValueError(
+                    f"Expected stylometric features with dim={self.stylometric_dim}, "
+                    f"got {stylometric_features.size(-1)}"
+                )
+            style_repr = self.stylometric_projector(
+                stylometric_features.to(device=pooled.device, dtype=pooled.dtype)
+            )
+            pooled = torch.cat([pooled, style_repr], dim=-1)
         logits = self.head(pooled).squeeze(-1)  # (B,)
         return logits

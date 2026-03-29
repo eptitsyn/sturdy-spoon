@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -70,6 +71,11 @@ def validate_checkpoint_dir(checkpoint_dir: Path) -> None:
     required_files = [
         checkpoint_dir / "best_model.pt",
     ]
+    model_config_path = checkpoint_dir / "model_config.json"
+    if model_config_path.exists():
+        model_config = json.loads(model_config_path.read_text(encoding="utf-8"))
+        if int(model_config.get("stylometric_dim", 0)) > 0:
+            required_files.append(checkpoint_dir / "stylometry.pt")
     tokenizer_dir = checkpoint_dir / "tokenizer"
     if not tokenizer_dir.exists():
         required_files.append(tokenizer_dir)

@@ -10,7 +10,7 @@ import torch
 from torch.amp import autocast
 
 from model import AITextDetector
-from data import BPETokenizer
+from data import BPETokenizer, StylometricVectorizer
 
 
 @dataclass
@@ -27,6 +27,7 @@ class Detector:
         self,
         model: AITextDetector,
         tokenizer: BPETokenizer,
+        vectorizer: StylometricVectorizer | None = None,
         device: str = "auto",
         threshold: float = 0.5,
     ):
@@ -35,6 +36,7 @@ class Detector:
         )
         self.model = model.to(self.device).eval()
         self.tokenizer = tokenizer
+        self.vectorizer = vectorizer
         self.threshold = threshold
 
     @classmethod
@@ -61,15 +63,31 @@ class Detector:
             inference_config = json.loads(inference_config_path.read_text(encoding="utf-8"))
             threshold = float(inference_config.get("threshold", 0.5))
 
+        vectorizer = None
+        stylometry_path = ckpt / "stylometry.pt"
+        if stylometry_path.exists():
+            vectorizer = StylometricVectorizer.load(stylometry_path)
+        elif int(saved_model_config.get("stylometric_dim", 0)) > 0:
+            raise FileNotFoundError(
+                "Stylometric vectorizer file not found in checkpoint. "
+                "Retrain or re-export the checkpoint with stylometry enabled."
+            )
+
         model = AITextDetector(**saved_model_config)
         model.load_state_dict(torch.load(ckpt / "best_model.pt", weights_only=True, map_location="cpu"))
-        return cls(model, tokenizer, device, threshold=threshold)
+        return cls(model, tokenizer, vectorizer, device, threshold=threshold)
+
+    def _style_features(self, texts: list[str]) -> torch.Tensor:
+        if self.vectorizer is None:
+            return torch.zeros((len(texts), 0), dtype=torch.float32, device=self.device)
+        return self.vectorizer.transform_batch(texts).to(self.device)
 
     @torch.no_grad()
     def predict(self, text: str) -> DetectionResult:
         ids = torch.tensor([self.tokenizer.encode(text)], dtype=torch.long, device=self.device)
+        style_features = self._style_features([text])
         with autocast(self.device.type):
-            logit = self.model(ids).item()
+            logit = self.model(ids, style_features).item()
         prob = torch.sigmoid(torch.tensor(logit)).item()
         return DetectionResult(
             label="AI" if prob >= self.threshold else "Human",
@@ -82,9 +100,10 @@ class Detector:
         encoded = [torch.tensor(self.tokenizer.encode(t), dtype=torch.long) for t in texts]
         from torch.nn.utils.rnn import pad_sequence
         padded = pad_sequence(encoded, batch_first=True, padding_value=0).to(self.device)
+        style_features = self._style_features(texts)
 
         with autocast(self.device.type):
-            logits = self.model(padded)
+            logits = self.model(padded, style_features)
 
         results = []
         for logit in logits.cpu().tolist():

@@ -5,6 +5,7 @@ per-source breakdown, threshold tuning.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -23,9 +24,22 @@ from sklearn.metrics import (
 )
 
 from model import AITextDetector
-from data import BPETokenizer, TextClassificationDataset, collate_fn
+from data import BPETokenizer, StylometricVectorizer, TextClassificationDataset, collate_fn
 from inference import Detector
-from ui import RICH_AVAILABLE, Table, box, console, print_info, print_section
+from ui import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    RICH_AVAILABLE,
+    SpinnerColumn,
+    Table,
+    TextColumn,
+    TimeElapsedColumn,
+    box,
+    console,
+    print_info,
+    print_section,
+)
 
 
 # ─── Основные метрики ─────────────────────────────────────────────────────────
@@ -50,6 +64,7 @@ class EvalResult:
 def evaluate_model(
     model: AITextDetector,
     tokenizer: BPETokenizer,
+    vectorizer: StylometricVectorizer | None,
     texts: Sequence[str],
     labels: Sequence[int],
     batch_size: int = 32,
@@ -76,17 +91,18 @@ def evaluate_model(
     )
     model = model.to(dev).eval()
 
-    dataset = TextClassificationDataset(texts, labels, tokenizer)
+    dataset = TextClassificationDataset(texts, labels, tokenizer, vectorizer)
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
 
     all_logits: list[float] = []
     all_labels: list[int] = []
 
     with torch.no_grad():
-        for input_ids, targets in loader:
+        for input_ids, stylometric_features, targets in loader:
             input_ids = input_ids.to(dev)
+            stylometric_features = stylometric_features.to(dev)
             with autocast(dev.type):
-                logits = model(input_ids)
+                logits = model(input_ids, stylometric_features)
             all_logits.extend(logits.cpu().tolist())
             all_labels.extend(targets.int().tolist())
 
@@ -166,34 +182,66 @@ def evaluate_per_source(
         texts.append(s.text)
         labels.append(s.label.value if hasattr(s.label, "value") else int(s.label))
 
+    eligible_sources = [
+        (source, texts, labels)
+        for source, (texts, labels) in sorted(by_source.items())
+        if len(set(labels)) >= 2
+    ]
+
     results = []
-    for source, (texts, labels) in sorted(by_source.items()):
-        if len(set(labels)) < 2:
-            continue
+    progress_context = (
+        Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        )
+        if RICH_AVAILABLE
+        else nullcontext()
+    )
+    with progress_context as progress:
+        sources_task = (
+            progress.add_task("Per-source breakdown", total=len(eligible_sources))
+            if RICH_AVAILABLE
+            else None
+        )
+        for source, texts, labels in eligible_sources:
+            preds = []
+            probs = []
+            sample_task = (
+                progress.add_task(f"Scoring {source}", total=len(texts))
+                if RICH_AVAILABLE
+                else None
+            )
+            for t in texts:
+                r = detector.predict(t)
+                preds.append(1 if r.label == "AI" else 0)
+                probs.append(r.confidence if r.label == "AI" else 1 - r.confidence)
+                if RICH_AVAILABLE:
+                    progress.advance(sample_task)
 
-        preds = []
-        probs = []
-        for t in texts:
-            r = detector.predict(t)
-            preds.append(1 if r.label == "AI" else 0)
-            probs.append(r.confidence if r.label == "AI" else 1 - r.confidence)
+            preds_arr = np.array(preds)
+            labels_arr = np.array(labels)
+            probs_arr = np.array(probs)
 
-        preds_arr = np.array(preds)
-        labels_arr = np.array(labels)
-        probs_arr = np.array(probs)
+            try:
+                auc = roc_auc_score(labels_arr, probs_arr)
+            except ValueError:
+                auc = 0.0
 
-        try:
-            auc = roc_auc_score(labels_arr, probs_arr)
-        except ValueError:
-            auc = 0.0
-
-        results.append(SourceBreakdown(
-            source=source,
-            n_samples=len(texts),
-            accuracy=accuracy_score(labels_arr, preds_arr),
-            f1=f1_score(labels_arr, preds_arr, average="macro"),
-            roc_auc=auc,
-        ))
+            results.append(SourceBreakdown(
+                source=source,
+                n_samples=len(texts),
+                accuracy=accuracy_score(labels_arr, preds_arr),
+                f1=f1_score(labels_arr, preds_arr, average="macro"),
+                roc_auc=auc,
+            ))
+            if RICH_AVAILABLE:
+                progress.remove_task(sample_task)
+                progress.advance(sources_task)
 
     return results
 

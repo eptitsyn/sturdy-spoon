@@ -37,7 +37,7 @@ from sklearn.metrics import f1_score, precision_recall_curve, roc_auc_score
 from sklearn.model_selection import train_test_split
 
 from model import AITextDetector
-from data import BPETokenizer, TextClassificationDataset, collate_fn
+from data import BPETokenizer, StylometricVectorizer, TextClassificationDataset, collate_fn
 
 
 @dataclass
@@ -147,10 +147,11 @@ def _calibrate_threshold(
     labels_list: list[int] = []
 
     with torch.no_grad():
-        for input_ids, targets in loader:
+        for input_ids, stylometric_features, targets in loader:
             input_ids = input_ids.to(device)
+            stylometric_features = stylometric_features.to(device)
             with torch.autocast(device_type=device.type, enabled=use_amp and device.type != "cpu"):
-                logits = model(input_ids)
+                logits = model(input_ids, stylometric_features)
             logits_list.extend(logits.cpu().tolist())
             labels_list.extend(targets.int().cpu().tolist())
 
@@ -189,12 +190,16 @@ class AIDetectorModule(pl.LightningModule):
         self.validation_logits: list[torch.Tensor] = []
         self.validation_targets: list[torch.Tensor] = []
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model(input_ids)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        stylometric_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model(input_ids, stylometric_features)
 
     def training_step(self, batch, batch_idx):
-        input_ids, targets = batch
-        logits = self(input_ids)
+        input_ids, stylometric_features, targets = batch
+        logits = self(input_ids, stylometric_features)
         loss = self.criterion(logits, targets)
         acc = ((logits > 0).long() == targets.long()).float().mean()
         self.log("train_loss", loss, on_epoch=True, on_step=False, prog_bar=True)
@@ -206,8 +211,8 @@ class AIDetectorModule(pl.LightningModule):
         self.validation_targets.clear()
 
     def validation_step(self, batch, batch_idx):
-        input_ids, targets = batch
-        logits = self(input_ids)
+        input_ids, stylometric_features, targets = batch
+        logits = self(input_ids, stylometric_features)
         loss = self.criterion(logits, targets)
         self.validation_logits.append(logits.detach().cpu())
         self.validation_targets.append(targets.detach().cpu())
@@ -257,7 +262,7 @@ def train(
     texts: list[str],
     labels: list[int],
     config: TrainConfig | None = None,
-) -> tuple[AITextDetector, BPETokenizer, float]:
+) -> tuple[AITextDetector, BPETokenizer, StylometricVectorizer, float]:
     """
     Полный цикл тренировки с PyTorch Lightning.
 
@@ -286,8 +291,9 @@ def train(
         max_vocab=cfg.max_vocab,
         max_len=cfg.max_len,
     )
-    train_ds = TextClassificationDataset(train_texts, train_labels, tokenizer)
-    val_ds = TextClassificationDataset(val_texts, val_labels, tokenizer)
+    stylometric_vectorizer = StylometricVectorizer.fit(train_texts)
+    train_ds = TextClassificationDataset(train_texts, train_labels, tokenizer, stylometric_vectorizer)
+    val_ds = TextClassificationDataset(val_texts, val_labels, tokenizer, stylometric_vectorizer)
 
     train_loader = DataLoader(
         train_ds,
@@ -321,6 +327,7 @@ def train(
         pad_idx=tokenizer.pad_idx,
         unk_idx=tokenizer.unk_idx,
         token_dropout=cfg.token_dropout,
+        stylometric_dim=stylometric_vectorizer.feature_dim,
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -376,6 +383,7 @@ def train(
     }
     torch.save(state_dict, save_dir / "best_model.pt")
     tokenizer.save(save_dir / "tokenizer")
+    stylometric_vectorizer.save(save_dir / "stylometry.pt")
     model_config = {
         "vocab_size": tokenizer.vocab_size,
         "d_model": cfg.d_model,
@@ -387,6 +395,7 @@ def train(
         "pad_idx": tokenizer.pad_idx,
         "unk_idx": tokenizer.unk_idx,
         "token_dropout": 0.0,
+        "stylometric_dim": stylometric_vectorizer.feature_dim,
     }
     (save_dir / "model_config.json").write_text(
         json.dumps(model_config, indent=2),
@@ -403,4 +412,4 @@ def train(
         encoding="utf-8",
     )
     print(f"Calibrated threshold: {calibrated_threshold:.3f}")
-    return model, tokenizer, calibrated_threshold
+    return model, tokenizer, stylometric_vectorizer, calibrated_threshold

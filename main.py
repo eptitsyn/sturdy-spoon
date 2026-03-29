@@ -162,20 +162,20 @@ def main():
         seed=args.seed,
     )
 
-    model, tokenizer, threshold = train(train_texts, train_labels, train_cfg)
+    model, tokenizer, stylometric_vectorizer, threshold = train(train_texts, train_labels, train_cfg)
 
     # ── 3. Оценка на тестовой выборке ────────────────────────────────────
     print_section("STEP 3: Evaluation on held-out test set")
 
     eval_result = evaluate_model(
-        model, tokenizer, test_texts, test_labels,
+        model, tokenizer, stylometric_vectorizer, test_texts, test_labels,
         batch_size=args.batch_size,
         threshold=threshold,
     )
     print_eval_report(eval_result, title="Test Set Evaluation")
 
     # ── 4. Per-source breakdown ──────────────────────────────────────────
-    detector = Detector(model, tokenizer, threshold=threshold)
+    detector = Detector(model, tokenizer, stylometric_vectorizer, threshold=threshold)
     breakdowns = evaluate_per_source(detector, test_samples)
     if breakdowns:
         print_source_breakdown(breakdowns)
