@@ -1,0 +1,8 @@
+{
+  "type": "bytelevel_bpe",
+  "max_len": 512,
+  "special_tokens": [
+    "[PAD]",
+    "[UNK]"
+  ]
+}
