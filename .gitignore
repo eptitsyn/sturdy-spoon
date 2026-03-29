@@ -209,3 +209,4 @@ __marimo__/
 #PL
 checkpoints/
 lightning_logs/
+tokens.sh

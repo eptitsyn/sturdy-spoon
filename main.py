@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--max-per-source", type=int, default=100_000)
     p.add_argument("--max-total", type=int, default=200_000)
-    p.add_argument("--min-text-len", type=int, default=10)
+    p.add_argument("--min-text-len", type=int, default=35)
     p.add_argument("--max-text-len", type=int, default=3_000)
     p.add_argument("--test-ratio", type=float, default=0.15, help="Доля тестовой выборки")
     p.add_argument("--cache-dir", default=".cache/datasets")
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-layers", type=int, default=4)
     p.add_argument("--dim-ff", type=int, default=512)
     p.add_argument("--max-seq-len", type=int, default=512)
-    p.add_argument("--vocab-size", type=int, default=30_000)
+    p.add_argument("--vocab-size", type=int, default=50_000)
 
     # Training
     p.add_argument("--epochs", type=int, default=10)

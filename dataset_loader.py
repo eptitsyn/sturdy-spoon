@@ -33,7 +33,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
-from datasets import load_dataset
 from ui import (
     BarColumn,
     MofNCompleteColumn,
@@ -47,6 +46,13 @@ from ui import (
     print_success,
     print_warning,
 )
+
+
+def _load_dataset(*args, **kwargs):
+    from datasets import load_dataset
+
+    kwargs.setdefault("cache_dir", os.getenv("HF_DATASETS_CACHE", ".cache/hf_datasets"))
+    return load_dataset(*args, **kwargs)
 
 
 # ─── Types ────────────────────────────────────────────────────────────────────
@@ -129,7 +135,7 @@ _KAGGLE_DATASETS = {
     "daigt_proper": "thedrcat/daigt-v2-train-dataset",
     "daigt_v2": "thedrcat/daigt-v2-train-dataset",
 }
-_SOURCE_CACHE_SCHEMA_VERSION = 6
+_SOURCE_CACHE_SCHEMA_VERSION = 9
 _SOURCE_ALIASES = {
     "ruatd": "coat",
     "daigt_v2": "daigt_proper",
@@ -157,6 +163,15 @@ def _raw_source_dir(source_name: str, cfg: DatasetConfig) -> Path:
     path = Path(cfg.cache_dir).expanduser() / "raw_sources" / source_name
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _has_supported_files(path: Path) -> bool:
+    return any(
+        candidate.is_file()
+        and candidate.suffix.lower() in _SUPPORTED_LOCAL_SUFFIXES
+        and candidate.stat().st_size > 0
+        for candidate in path.rglob("*")
+    )
 
 
 def _reservoir_add(
@@ -299,16 +314,116 @@ def _ensure_hf_raw_source(source_name: str, repo_id: str, cfg: DatasetConfig) ->
     from huggingface_hub import snapshot_download
 
     raw_dir = _raw_source_dir(source_name, cfg)
-    if any(path.is_file() and path.suffix.lower() in _SUPPORTED_LOCAL_SUFFIXES for path in raw_dir.rglob("*")):
+    if _has_supported_files(raw_dir):
         return raw_dir
 
-    snapshot_download(
+    snapshot_path = Path(snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
-        local_dir=str(raw_dir),
         allow_patterns=_HF_SNAPSHOT_PATTERNS,
-    )
+    ))
+    if not _has_supported_files(snapshot_path):
+        raise FileNotFoundError(
+            f"Hugging Face snapshot for {repo_id} did not contain supported source files."
+        )
+
+    for src_file in snapshot_path.rglob("*"):
+        if not src_file.is_file():
+            continue
+        if src_file.suffix.lower() not in _SUPPORTED_LOCAL_SUFFIXES:
+            continue
+        relative_path = src_file.relative_to(snapshot_path)
+        target_file = raw_dir / relative_path
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        if not target_file.exists():
+            shutil.copy2(src_file, target_file)
+
+    if not _has_supported_files(raw_dir):
+        raise FileNotFoundError(
+            f"Failed to populate raw source cache for {repo_id} into {raw_dir}."
+        )
     return raw_dir
+
+
+def _ensure_hf_raw_export(
+    source_name: str,
+    repo_id: str,
+    cfg: DatasetConfig,
+    *,
+    split: str = "train",
+    config_name: str | None = None,
+    target_rows: int | None = None,
+) -> Path:
+    raw_dir = _raw_source_dir(source_name, cfg)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    if _has_supported_files(raw_dir):
+        return raw_dir
+
+    split_candidates: list[str | None] = []
+    for candidate in (split, "train", "validation", "test", None):
+        if candidate not in split_candidates:
+            split_candidates.append(candidate)
+
+    row_limit = target_rows if target_rows is not None else cfg.max_per_source
+    last_error: Exception | None = None
+
+    for split_candidate in split_candidates:
+        selected_split = split_candidate
+        dataset_kwargs = {"streaming": True}
+        if config_name is not None:
+            dataset_kwargs["name"] = config_name
+        if split_candidate is not None:
+            dataset_kwargs["split"] = split_candidate
+
+        try:
+            ds = _load_dataset(repo_id, **dataset_kwargs)
+            if split_candidate is None:
+                split_names = list(ds.keys())
+                if not split_names:
+                    raise FileNotFoundError(f"No splits found for {repo_id}")
+                selected_split = "train" if "train" in ds else split_names[0]
+                ds = ds[selected_split]
+
+            export_name_parts = [part for part in [config_name, selected_split] if part]
+            export_name = "_".join(export_name_parts) if export_name_parts else "data"
+            export_path = raw_dir / f"{export_name}.jsonl"
+            if export_path.exists() and export_path.stat().st_size > 0:
+                return raw_dir
+
+            with export_path.open("w", encoding="utf-8") as handle:
+                for idx, row in enumerate(ds):
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    if row_limit is not None and idx + 1 >= row_limit:
+                        break
+            return raw_dir
+        except Exception as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise RuntimeError(f"Failed to export raw data for {repo_id}") from last_error
+    raise RuntimeError(f"Failed to export raw data for {repo_id}")
+
+
+def _ensure_hf_source_ready(
+    source_name: str,
+    repo_id: str,
+    cfg: DatasetConfig,
+    *,
+    split: str = "train",
+    config_name: str | None = None,
+    target_rows: int | None = None,
+) -> Path:
+    try:
+        return _ensure_hf_raw_source(source_name, repo_id, cfg)
+    except FileNotFoundError:
+        return _ensure_hf_raw_export(
+            source_name,
+            repo_id,
+            cfg,
+            split=split,
+            config_name=config_name,
+            target_rows=target_rows,
+        )
 
 
 def _download_kaggle_dataset(source_name: str, cfg: DatasetConfig) -> Path:
@@ -395,7 +510,7 @@ def _iter_local_rows(path: Path, split_hint: str | None = None) -> Iterator[tupl
     else:
         files = sorted(
             p for p in path.rglob("*")
-            if p.is_file() and p.suffix.lower() in _SUPPORTED_LOCAL_SUFFIXES
+            if p.is_file() and p.suffix.lower() in _SUPPORTED_LOCAL_SUFFIXES and p.stat().st_size > 0
         )
 
     if split_hint:
@@ -443,7 +558,7 @@ def _iter_local_rows(path: Path, split_hint: str | None = None) -> Iterator[tupl
             continue
 
         if suffix == ".parquet":
-            ds = load_dataset("parquet", data_files=str(file_path), split="train", streaming=True)
+            ds = _load_dataset("parquet", data_files=str(file_path), split="train", streaming=True)
             for row in ds:
                 yield row, file_path
 
@@ -547,7 +662,14 @@ def _iter_raid(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[S
     model='human' → human, иначе → AI.
     """
     count = 0
-    raw_dir = _ensure_hf_raw_source("raid", "liamdugan/raid", cfg or DatasetConfig())
+    runtime_cfg = cfg or DatasetConfig()
+    raw_dir = _ensure_hf_source_ready(
+        "raid",
+        "liamdugan/raid",
+        runtime_cfg,
+        split="train",
+        target_rows=max_samples,
+    )
     for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         text = (row.get("generation") or "").strip()
         if not text:
@@ -579,7 +701,14 @@ def _iter_ai_pile(max_samples: int, cfg: DatasetConfig | None = None) -> Iterato
     seen_humans = 0
     seen_ais = 0
 
-    raw_dir = _ensure_hf_raw_source("ai_pile", "artem9k/ai-text-detection-pile", cfg or DatasetConfig())
+    runtime_cfg = cfg or DatasetConfig()
+    raw_dir = _ensure_hf_source_ready(
+        "ai_pile",
+        "artem9k/ai-text-detection-pile",
+        runtime_cfg,
+        split="train",
+        target_rows=max_samples * 4,
+    )
     for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         text = (row.get("text") or "").strip()
         if not text:
@@ -613,7 +742,14 @@ def _iter_gpt_wiki(max_samples: int, cfg: DatasetConfig | None = None) -> Iterat
     Каждый ряд даёт 2 сэмпла.
     """
     count = 0
-    raw_dir = _ensure_hf_raw_source("gpt_wiki", "aadityaubhat/GPT-wiki-intro", cfg or DatasetConfig())
+    runtime_cfg = cfg or DatasetConfig()
+    raw_dir = _ensure_hf_source_ready(
+        "gpt_wiki",
+        "aadityaubhat/GPT-wiki-intro",
+        runtime_cfg,
+        split="train",
+        target_rows=max_samples,
+    )
     for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         wiki = (row.get("wiki_intro") or "").strip()
         gen = (row.get("generated_intro") or "").strip()
@@ -649,7 +785,14 @@ def _iter_human_vs_ai(max_samples: int, cfg: DatasetConfig | None = None) -> Ite
     Paired: human essays vs AI-generated essays.
     """
     count = 0
-    raw_dir = _ensure_hf_raw_source("human_vs_ai", "dmitva/human_ai_generated_text", cfg or DatasetConfig())
+    runtime_cfg = cfg or DatasetConfig()
+    raw_dir = _ensure_hf_source_ready(
+        "human_vs_ai",
+        "dmitva/human_ai_generated_text",
+        runtime_cfg,
+        split="train",
+        target_rows=max_samples,
+    )
     for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         human = (row.get("human_text") or "").strip()
         ai = (row.get("ai_text") or "").strip()
@@ -686,7 +829,14 @@ def _iter_ai_human_mixed(max_samples: int, cfg: DatasetConfig | None = None) -> 
     label: 0 = human, 1 = AI.
     """
     count = 0
-    raw_dir = _ensure_hf_raw_source("ai_human_mixed", "Ateeqq/AI-and-Human-Generated-Text", cfg or DatasetConfig())
+    runtime_cfg = cfg or DatasetConfig()
+    raw_dir = _ensure_hf_source_ready(
+        "ai_human_mixed",
+        "Ateeqq/AI-and-Human-Generated-Text",
+        runtime_cfg,
+        split="train",
+        target_rows=max_samples,
+    )
     for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         text = (row.get("abstract") or "").strip()
         if not text:
@@ -762,11 +912,21 @@ def _iter_hc3(max_samples: int, cfg: DatasetConfig | None = None) -> Iterator[Sa
 def _iter_coat(max_samples: int, cfg: DatasetConfig | None = None, source_name: str = "coat") -> Iterator[Sample]:
     """
     CoAT: RussianNLP/coat
-    Public binary subset for Russian AI-text detection.
+    Authorship subset for Russian AI-text detection.
+    label == "Human" -> human, any model name -> AI.
     """
     count = 0
-    raw_dir = _ensure_hf_raw_source(source_name, "RussianNLP/coat", cfg or DatasetConfig())
-    for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
+    runtime_cfg = cfg or DatasetConfig()
+    raw_dir = _ensure_hf_source_ready(
+        source_name,
+        "RussianNLP/coat",
+        runtime_cfg,
+        split="train",
+        config_name="authorship",
+        target_rows=max_samples,
+    )
+    coat_path = raw_dir / "authorship" if (raw_dir / "authorship").exists() else raw_dir
+    for row, _ in _iter_local_rows(coat_path, split_hint="train"):
         text = _clean_text(row.get("text"))
         raw_label = _clean_text(row.get("label"))
         normalized_label = _normalize_label_text(row.get("label"))
@@ -815,7 +975,14 @@ def _iter_gsingh_train(max_samples: int, cfg: DatasetConfig | None = None) -> It
         "GPT_4-o",
     ]
 
-    raw_dir = _ensure_hf_raw_source("gsingh_train", "gsingh1-py/train", cfg or DatasetConfig())
+    runtime_cfg = cfg or DatasetConfig()
+    raw_dir = _ensure_hf_source_ready(
+        "gsingh_train",
+        "gsingh1-py/train",
+        runtime_cfg,
+        split="train",
+        target_rows=max_samples,
+    )
     for row, _ in _iter_local_rows(raw_dir, split_hint="train"):
         human_text = _clean_text(row.get("Human_story"))
         if human_text:
