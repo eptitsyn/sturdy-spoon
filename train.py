@@ -19,9 +19,15 @@ from torch.utils.data import DataLoader
 
 warnings.filterwarnings(
     "ignore",
-    message=r"`isinstance\(treespec, LeafSpec\)` is deprecated.*",
-    category=DeprecationWarning,
     module=r"pytorch_lightning\.utilities\._pytree",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*LeafSpec.*deprecated.*",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*lr_scheduler\.step\(\).*before `optimizer\.step\(\)`.*",
 )
 
 import pytorch_lightning as pl
@@ -326,8 +332,12 @@ def train(
     save_dir = Path(cfg.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    logger = CSVLogger(save_dir=str(save_dir), name="logs")
+    checkpoint_dir = Path(logger.log_dir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     checkpoint_cb = ModelCheckpoint(
-        dirpath=save_dir,
+        dirpath=checkpoint_dir,
         filename="best_checkpoint",
         monitor="val_f1_macro",
         mode="max",
@@ -340,7 +350,6 @@ def train(
     )
 
     use_amp = cfg.use_amp and torch.cuda.is_available()
-    logger = CSVLogger(save_dir=str(save_dir), name="logs")
     trainer = pl.Trainer(
         max_epochs=cfg.epochs,
         callbacks=[checkpoint_cb, early_stopping_cb],

@@ -115,7 +115,7 @@ _KAGGLE_DATASETS = {
     "daigt_proper": "thedrcat/daigt-v2-train-dataset",
     "daigt_v2": "thedrcat/daigt-v2-train-dataset",
 }
-_SOURCE_CACHE_SCHEMA_VERSION = 4
+_SOURCE_CACHE_SCHEMA_VERSION = 5
 _SOURCE_ALIASES = {
     "ruatd": "coat",
     "daigt_v2": "daigt_proper",
@@ -696,15 +696,22 @@ def _iter_coat(max_samples: int, cfg: DatasetConfig | None = None, source_name: 
     count = 0
     for row in ds:
         text = _clean_text(row.get("text"))
-        label = _parse_label(row.get("label"))
-        if not text or label is None:
+        raw_label = _clean_text(row.get("label"))
+        if not text or not raw_label:
             continue
+
+        if raw_label.lower() == "human":
+            label = Label.HUMAN
+            generator = "human"
+        else:
+            label = Label.AI
+            generator = raw_label
 
         yield Sample(
             text=text,
             label=label,
             source_dataset=source_name,
-            generator="human" if label == Label.HUMAN else "unknown_ru_model",
+            generator=generator,
             domain=_clean_text(row.get("domain")) or "russian",
         )
         count += 1
