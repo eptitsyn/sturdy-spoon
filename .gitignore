@@ -209,3 +209,4 @@ __marimo__/
 #PL
 lightning_logs/
 tokens.sh
+creds.sh
