@@ -1,17 +1,18 @@
-"""Training pipeline для AI text detector."""
+"""Training pipeline для AI text detector — PyTorch Lightning."""
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, random_split
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from model import AITextDetector
 from data import WordTokenizer, TextClassificationDataset, collate_fn
@@ -42,13 +43,54 @@ class TrainConfig:
     save_dir: str = "checkpoints"
 
 
+class AIDetectorModule(pl.LightningModule):
+    """LightningModule wrapping AITextDetector."""
+
+    def __init__(self, model: AITextDetector, cfg: TrainConfig, total_steps: int):
+        super().__init__()
+        self.model = model
+        self.cfg = cfg
+        self.total_steps = total_steps
+        self.criterion = nn.BCEWithLogitsLoss()
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model(input_ids)
+
+    def training_step(self, batch, batch_idx):
+        input_ids, targets = batch
+        logits = self(input_ids)
+        loss = self.criterion(logits, targets)
+        acc = ((logits > 0).long() == targets.long()).float().mean()
+        self.log("train_loss", loss, on_epoch=True, on_step=False, prog_bar=True)
+        self.log("train_acc", acc, on_epoch=True, on_step=False, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        input_ids, targets = batch
+        logits = self(input_ids)
+        loss = self.criterion(logits, targets)
+        acc = ((logits > 0).long() == targets.long()).float().mean()
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
+        self.log("val_acc", acc, on_epoch=True, prog_bar=True)
+
+    def configure_optimizers(self):
+        optimizer = AdamW(
+            self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.total_steps)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
+
+
 def train(
     texts: list[str],
     labels: list[int],
     config: TrainConfig | None = None,
 ) -> tuple[AITextDetector, WordTokenizer]:
     """
-    Полный цикл тренировки.
+    Полный цикл тренировки с PyTorch Lightning.
 
     Args:
         texts: список текстов
@@ -59,9 +101,7 @@ def train(
         (model, tokenizer)
     """
     cfg = config or TrainConfig()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(cfg.seed)
-    print(f"Device: {device}")
 
     # ── Tokenizer & Data ─────────────────────────────────────────────────
     tokenizer = WordTokenizer.from_texts(texts, max_vocab=cfg.max_vocab, max_len=cfg.max_len)
@@ -69,13 +109,16 @@ def train(
 
     val_size = int(len(dataset) * cfg.val_split)
     train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    train_ds, val_ds = random_split(
+        dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(cfg.seed),
+    )
 
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=0
+        train_ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=9
     )
     val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, collate_fn=collate_fn, num_workers=0
+        val_ds, batch_size=cfg.batch_size, collate_fn=collate_fn, num_workers=9
     )
 
     print(f"Vocab: {tokenizer.vocab_size} | Train: {train_size} | Val: {val_size}")
@@ -89,90 +132,50 @@ def train(
         dim_feedforward=cfg.dim_feedforward,
         max_len=cfg.max_len,
         dropout=cfg.dropout,
-    ).to(device)
+    )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
 
-    # ── Optimizer & Scheduler ────────────────────────────────────────────
-    optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs * len(train_loader))
-    scaler = GradScaler(enabled=cfg.use_amp and device.type == "cuda")
-    criterion = nn.BCEWithLogitsLoss()
+    total_steps = cfg.epochs * len(train_loader)
+    lit_model = AIDetectorModule(model, cfg, total_steps)
 
-    # ── Training Loop ────────────────────────────────────────────────────
+    # ── Callbacks & Trainer ──────────────────────────────────────────────
     save_dir = Path(cfg.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    best_val_acc = 0.0
 
-    for epoch in range(1, cfg.epochs + 1):
-        # Train
-        model.train()
-        total_loss, correct, total = 0.0, 0, 0
-        t0 = time.perf_counter()
+    checkpoint_cb = ModelCheckpoint(
+        dirpath=save_dir,
+        filename="best_checkpoint",
+        monitor="val_acc",
+        mode="max",
+        save_top_k=1,
+    )
 
-        for input_ids, targets in train_loader:
-            input_ids, targets = input_ids.to(device), targets.to(device)
+    use_amp = cfg.use_amp and torch.cuda.is_available()
+    trainer = pl.Trainer(
+        max_epochs=cfg.epochs,
+        callbacks=[checkpoint_cb],
+        precision="16-mixed" if use_amp else "32-true",
+        enable_progress_bar=True,
+        log_every_n_steps=10,
+    )
 
-            with autocast(device.type, enabled=cfg.use_amp):
-                logits = model(input_ids)
-                loss = criterion(logits, targets)
+    trainer.fit(lit_model, train_loader, val_loader)
 
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+    # ── Save in inference-compatible format ──────────────────────────────
+    best_ckpt = torch.load(checkpoint_cb.best_model_path, weights_only=True)
+    # Lightning prefixes keys with "model." — strip it for inference.py
+    state_dict = {
+        k.removeprefix("model."): v
+        for k, v in best_ckpt["state_dict"].items()
+        if k.startswith("model.")
+    }
+    torch.save(state_dict, save_dir / "best_model.pt")
+    tokenizer.save(save_dir / "tokenizer.json")
 
-            total_loss += loss.item() * targets.size(0)
-            preds = (logits > 0).long()
-            correct += (preds == targets.long()).sum().item()
-            total += targets.size(0)
-
-        train_loss = total_loss / total
-        train_acc = correct / total
-
-        # Validate
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device, cfg.use_amp)
-        elapsed = time.perf_counter() - t0
-
-        print(
-            f"Epoch {epoch:02d}/{cfg.epochs} | "
-            f"Train Loss: {train_loss:.4f} Acc: {train_acc:.3f} | "
-            f"Val Loss: {val_loss:.4f} Acc: {val_acc:.3f} | "
-            f"{elapsed:.1f}s"
-        )
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), save_dir / "best_model.pt")
-            tokenizer.save(save_dir / "tokenizer.json")
-            print(f"  ✓ Saved best model (val_acc={val_acc:.3f})")
-
+    best_val_acc = checkpoint_cb.best_model_score
     print(f"\nBest val accuracy: {best_val_acc:.3f}")
-    model.load_state_dict(torch.load(save_dir / "best_model.pt", weights_only=True))
+
+    model.load_state_dict(state_dict)
     return model, tokenizer
-
-
-@torch.no_grad()
-def evaluate(
-    model: AITextDetector,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    use_amp: bool = True,
-) -> tuple[float, float]:
-    model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-    for input_ids, targets in loader:
-        input_ids, targets = input_ids.to(device), targets.to(device)
-        with autocast(device.type, enabled=use_amp):
-            logits = model(input_ids)
-            loss = criterion(logits, targets)
-        total_loss += loss.item() * targets.size(0)
-        preds = (logits > 0).long()
-        correct += (preds == targets.long()).sum().item()
-        total += targets.size(0)
-    return total_loss / total, correct / total

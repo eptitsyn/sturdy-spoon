@@ -7,6 +7,7 @@
   • GPT-Wiki       — aadityaubhat/GPT-wiki-intro (Wikipedia vs GPT-3)
   • Human-vs-AI    — dmitva/human_ai_generated_text (human vs AI essays)
   • AI-Human-Mixed — Ateeqq/AI-and-Human-Generated-Text (GPT-4 + BARD)
+  • HC3            — Hello-SimpleAI/HC3 (Human vs ChatGPT, multi-domain)
 
 Использование:
     from dataset_loader import load_combined_dataset, DatasetConfig
@@ -61,7 +62,7 @@ class DatasetConfig:
 
     # Список всех доступных источников
     available_sources: list[str] = field(default_factory=lambda: [
-        "raid", "ai_pile", "gpt_wiki", "human_vs_ai", "ai_human_mixed",
+        "raid", "ai_pile", "gpt_wiki", "human_vs_ai", "ai_human_mixed", "hc3",
     ])
 
 
@@ -223,6 +224,55 @@ def _iter_ai_human_mixed(max_samples: int) -> Iterator[Sample]:
             return
 
 
+def _iter_hc3(max_samples: int) -> Iterator[Sample]:
+    """
+    HC3: Hello-SimpleAI/HC3
+    Human vs ChatGPT answers across domains (ELI5, finance, medicine, wiki, open QA).
+    Загрузка через huggingface_hub напрямую (loading script сломан).
+    """
+    import json
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download("Hello-SimpleAI/HC3", "all.jsonl", repo_type="dataset")
+    count = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if count >= max_samples:
+                return
+            row = json.loads(line)
+            domain = row.get("source", "unknown")
+
+            # Human answers
+            for answer in row.get("human_answers", []):
+                text = answer.strip()
+                if text:
+                    yield Sample(
+                        text=text,
+                        label=Label.HUMAN,
+                        source_dataset="hc3",
+                        generator="human",
+                        domain=domain,
+                    )
+                    count += 1
+                    if count >= max_samples:
+                        return
+
+            # ChatGPT answers
+            for answer in row.get("chatgpt_answers", []):
+                text = answer.strip()
+                if text:
+                    yield Sample(
+                        text=text,
+                        label=Label.AI,
+                        source_dataset="hc3",
+                        generator="chatgpt",
+                        domain=domain,
+                    )
+                    count += 1
+                    if count >= max_samples:
+                        return
+
+
 # ─── Registry ─────────────────────────────────────────────────────────────────
 
 _SOURCE_REGISTRY: dict[str, callable] = {
@@ -231,6 +281,7 @@ _SOURCE_REGISTRY: dict[str, callable] = {
     "gpt_wiki": _iter_gpt_wiki,
     "human_vs_ai": _iter_human_vs_ai,
     "ai_human_mixed": _iter_ai_human_mixed,
+    "hc3": _iter_hc3,
 }
 
 

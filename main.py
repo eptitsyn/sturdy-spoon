@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-Полный пайплайн: загрузка комбинированного датасета → тренировка → инференс.
+Полный пайплайн: загрузка → тренировка → оценка с метриками.
 
-Быстрый запуск (маленький сэмпл):
-    python main.py --max-per-source 2000 --max-total 5000 --epochs 5
+Быстрый тест:
+    python main.py --sources hc3 gpt_wiki --max-per-source 1000 --max-total 2000 --epochs 5
 
 Полная тренировка:
     python main.py --max-per-source 20000 --max-total 50000 --epochs 15
 
-Только конкретные датасеты:
-    python main.py --sources raid ai_pile --max-total 10000
+Только RAID + HC3:
+    python main.py --sources raid hc3 --max-total 30000 --epochs 10
 """
 
 from __future__ import annotations
 
 import argparse
+import random
 
 from dataset_loader import load_combined_dataset, DatasetConfig
 from train import train, TrainConfig
 from inference import Detector
+from evaluate import evaluate_model, evaluate_per_source, print_eval_report, print_source_breakdown
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,11 +28,12 @@ def parse_args() -> argparse.Namespace:
 
     # Data
     p.add_argument("--sources", nargs="+", default=None,
-                   help="Источники: raid, ai_pile, gpt_wiki, human_vs_ai, ai_human_mixed")
+                   help="raid, ai_pile, gpt_wiki, human_vs_ai, ai_human_mixed, hc3")
     p.add_argument("--max-per-source", type=int, default=5_000)
     p.add_argument("--max-total", type=int, default=20_000)
     p.add_argument("--min-text-len", type=int, default=50)
     p.add_argument("--max-text-len", type=int, default=3_000)
+    p.add_argument("--test-ratio", type=float, default=0.15, help="Доля тестовой выборки")
 
     # Model
     p.add_argument("--d-model", type=int, default=256)
@@ -49,12 +52,32 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def split_data(result, test_ratio: float, seed: int):
+    """Train/test split с сохранением метаданных сэмплов."""
+    rng = random.Random(seed)
+    indices = list(range(len(result.texts)))
+    rng.shuffle(indices)
+
+    split_idx = int(len(indices) * (1 - test_ratio))
+
+    train_idx = indices[:split_idx]
+    test_idx = indices[split_idx:]
+
+    train_texts = [result.texts[i] for i in train_idx]
+    train_labels = [result.labels[i] for i in train_idx]
+    test_texts = [result.texts[i] for i in test_idx]
+    test_labels = [result.labels[i] for i in test_idx]
+    test_samples = [result.samples[i] for i in test_idx]
+
+    return train_texts, train_labels, test_texts, test_labels, test_samples
+
+
 def main():
     args = parse_args()
 
     # ── 1. Загрузка данных ───────────────────────────────────────────────
     print("=" * 60)
-    print("STEP 1: Loading combined dataset")
+    print("  STEP 1: Loading combined dataset")
     print("=" * 60)
 
     data_cfg = DatasetConfig(
@@ -68,11 +91,16 @@ def main():
     )
 
     result = load_combined_dataset(data_cfg)
-    texts, labels = result.texts, result.labels
+
+    # Train/test split
+    train_texts, train_labels, test_texts, test_labels, test_samples = split_data(
+        result, args.test_ratio, args.seed
+    )
+    print(f"Train: {len(train_texts):,} | Test: {len(test_texts):,}")
 
     # ── 2. Тренировка ────────────────────────────────────────────────────
-    print("=" * 60)
-    print("STEP 2: Training")
+    print("\n" + "=" * 60)
+    print("  STEP 2: Training")
     print("=" * 60)
 
     train_cfg = TrainConfig(
@@ -88,46 +116,58 @@ def main():
         seed=args.seed,
     )
 
-    model, tokenizer = train(texts, labels, train_cfg)
+    model, tokenizer = train(train_texts, train_labels, train_cfg)
 
-    # ── 3. Инференс ──────────────────────────────────────────────────────
+    # ── 3. Оценка на тестовой выборке ────────────────────────────────────
     print("\n" + "=" * 60)
-    print("STEP 3: Inference demo")
+    print("  STEP 3: Evaluation on held-out test set")
     print("=" * 60)
 
+    eval_result = evaluate_model(
+        model, tokenizer, test_texts, test_labels,
+        batch_size=args.batch_size,
+    )
+    print_eval_report(eval_result, title="Test Set Evaluation")
+
+    # ── 4. Per-source breakdown ──────────────────────────────────────────
     detector = Detector(model, tokenizer)
+    breakdowns = evaluate_per_source(detector, test_samples)
+    if breakdowns:
+        print_source_breakdown(breakdowns)
 
-    test_texts = [
-        # Human-like
-        "Ну блин, опять забыл зонт и промок как собака. День не задался.",
-        "Just grabbed tacos for lunch, honestly best decision I've made all week lol",
-        "My cat knocked over my coffee this morning. I'm not even mad anymore, it's just what she does.",
-        "spent 3 hours debugging only to find a missing comma. classic monday vibes",
-        # AI-like
-        "The implementation of machine learning algorithms in healthcare has demonstrated significant potential "
-        "for improving diagnostic accuracy and patient outcomes across various medical specialties.",
-        "In conclusion, the comprehensive analysis of the aforementioned factors reveals a multifaceted "
-        "landscape that necessitates careful consideration of both quantitative and qualitative metrics.",
-        "This paper presents a novel approach to addressing the challenges associated with natural language "
-        "processing in low-resource settings, leveraging transfer learning methodologies.",
-        "Furthermore, it is important to note that the integration of these systems requires a holistic "
-        "understanding of the underlying computational frameworks and their practical implications.",
+    # ── 5. Живые примеры ─────────────────────────────────────────────────
+    print("=" * 60)
+    print("  STEP 4: Live inference examples")
+    print("=" * 60)
+
+    examples = [
+        ("Ну блин, опять забыл зонт и промок как собака.", "Human"),
+        ("Just grabbed tacos, best decision I've made all week lol", "Human"),
+        ("spent 3 hours debugging only to find a missing comma", "Human"),
+        ("The implementation of machine learning algorithms in healthcare has "
+         "demonstrated significant potential for improving diagnostic accuracy.", "AI"),
+        ("In conclusion, the comprehensive analysis reveals a multifaceted "
+         "landscape that necessitates careful consideration.", "AI"),
+        ("Furthermore, it is important to note that the integration of these "
+         "systems requires a holistic understanding of the underlying frameworks.", "AI"),
     ]
-
-    expected = ["Human"] * 4 + ["AI"] * 4
 
     print()
     correct = 0
-    for text, exp in zip(test_texts, expected):
+    for text, expected in examples:
         r = detector.predict(text)
-        ok = "✓" if r.label == exp else "✗"
+        ok = "✓" if r.label == expected else "✗"
         correct += ok == "✓"
         bar = "█" * int(r.confidence * 20) + "░" * (20 - int(r.confidence * 20))
-        print(f"  {ok} [{r.label:>5}] {r.confidence:.1%} {bar}")
-        print(f"    {text[:90]}...")
-        print()
+        print(f"  {ok} [{r.label:>5}] {r.confidence:.1%} {bar}  {text[:75]}...")
 
-    print(f"Demo accuracy: {correct}/{len(test_texts)} ({correct / len(test_texts):.0%})")
+    print(f"\n  Live accuracy: {correct}/{len(examples)}")
+    print(f"\n  Model saved to: checkpoints/")
+    print(f"  Usage:")
+    print(f"    from inference import Detector")
+    print(f"    detector = Detector.from_checkpoint('checkpoints/')")
+    print(f"    result = detector.predict('some text')")
+    print(f"    print(result.label, result.confidence)")
 
 
 if __name__ == "__main__":
