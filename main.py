@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-text-len", type=int, default=50)
     p.add_argument("--max-text-len", type=int, default=3_000)
     p.add_argument("--test-ratio", type=float, default=0.15, help="Доля тестовой выборки")
+    p.add_argument("--cache-dir", default=".cache/datasets")
+    p.add_argument("--no-dataset-cache", action="store_true", help="Disable on-disk source caching")
 
     # Model
     p.add_argument("--d-model", type=int, default=256)
@@ -133,6 +135,8 @@ def main():
         balance_labels=True,
         seed=args.seed,
         source_paths=source_paths,
+        cache_dir=args.cache_dir,
+        cache_sources=not args.no_dataset_cache,
     )
 
     result = load_combined_dataset(data_cfg)

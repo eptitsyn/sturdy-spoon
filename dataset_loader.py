@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import random
@@ -75,6 +76,7 @@ class DatasetConfig:
     source_paths: dict[str, str] = field(default_factory=dict)
     cache_dir: str = ".cache/datasets"
     auto_download_kaggle: bool = True
+    cache_sources: bool = True
 
     # Список всех доступных источников
     available_sources: list[str] = field(default_factory=lambda: [
@@ -113,6 +115,12 @@ _KAGGLE_DATASETS = {
     "daigt_proper": "thedrcat/daigt-v2-train-dataset",
     "daigt_v2": "thedrcat/daigt-v2-train-dataset",
 }
+_SOURCE_CACHE_SCHEMA_VERSION = 2
+_SOURCE_ALIASES = {
+    "ruatd": "coat",
+    "daigt_v2": "daigt_proper",
+    "gsingh1_train": "gsingh_train",
+}
 
 
 def _clean_text(value) -> str:
@@ -124,6 +132,10 @@ def _clean_text(value) -> str:
         parts = [str(item).strip() for item in value if str(item).strip()]
         return "\n".join(parts)
     return str(value).strip()
+
+
+def _canonical_source_name(source_name: str) -> str:
+    return _SOURCE_ALIASES.get(source_name, source_name)
 
 
 def _normalized_row(row: dict) -> dict[str, object]:
@@ -167,6 +179,78 @@ def _parse_label(value) -> Label | None:
     if text in {"0", "human", "written", "human-written", "original", "h", "false", "no"}:
         return Label.HUMAN
     return None
+
+
+def _sample_to_row(sample: Sample) -> dict[str, object]:
+    return {
+        "text": sample.text,
+        "label": int(sample.label),
+        "source_dataset": sample.source_dataset,
+        "generator": sample.generator,
+        "domain": sample.domain,
+    }
+
+
+def _row_to_sample(row: dict) -> Sample:
+    return Sample(
+        text=_clean_text(row.get("text")),
+        label=Label(int(row.get("label", 0))),
+        source_dataset=_clean_text(row.get("source_dataset")) or "unknown",
+        generator=_clean_text(row.get("generator")) or "unknown",
+        domain=_clean_text(row.get("domain")) or "unknown",
+    )
+
+
+def _source_cache_file(source_name: str, max_samples: int, cfg: DatasetConfig) -> Path:
+    source_path = cfg.source_paths.get(source_name) or ""
+    cache_key = {
+        "schema_version": _SOURCE_CACHE_SCHEMA_VERSION,
+        "source": source_name,
+        "max_samples": max_samples,
+        "source_path": str(Path(source_path).expanduser()) if source_path else "",
+    }
+    digest = hashlib.sha256(
+        json.dumps(cache_key, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()[:16]
+    cache_root = Path(cfg.cache_dir).expanduser() / "source_samples"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    return cache_root / f"{source_name}_{digest}.jsonl"
+
+
+def _load_cached_samples(cache_file: Path) -> list[Sample]:
+    samples: list[Sample] = []
+    with cache_file.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            samples.append(_row_to_sample(json.loads(line)))
+    return samples
+
+
+def _write_cached_samples(cache_file: Path, samples: list[Sample]) -> None:
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    with cache_file.open("w", encoding="utf-8") as handle:
+        for sample in samples:
+            handle.write(json.dumps(_sample_to_row(sample), ensure_ascii=False) + "\n")
+
+
+def _materialize_source(
+    source_name: str,
+    max_samples: int,
+    cfg: DatasetConfig,
+    loader_fn,
+) -> list[Sample]:
+    if not cfg.cache_sources:
+        return list(loader_fn(max_samples, cfg))
+
+    cache_file = _source_cache_file(source_name, max_samples, cfg)
+    if cache_file.exists():
+        return _load_cached_samples(cache_file)
+
+    samples = list(loader_fn(max_samples, cfg))
+    _write_cached_samples(cache_file, samples)
+    return samples
 
 
 def _download_kaggle_dataset(source_name: str, cfg: DatasetConfig) -> Path:
@@ -390,13 +474,15 @@ def _iter_ai_pile(max_samples: int, cfg: DatasetConfig | None = None) -> Iterato
     artem9k/ai-text-detection-pile
     Long-form essays: human, GPT-2, GPT-3, ChatGPT, GPT-J.
     """
+    seed = (cfg.seed if cfg is not None else 42)
     ds = load_dataset("artem9k/ai-text-detection-pile", split="train", streaming=True)
+    ds = ds.shuffle(seed=seed, buffer_size=min(max_samples * 4, 20_000))
     count = 0
     for row in ds:
         text = (row.get("text") or "").strip()
         if not text:
             continue
-        source = row.get("source", "unknown")
+        source = _clean_text(row.get("source")).lower() or "unknown"
         yield Sample(
             text=text,
             label=Label.HUMAN if source == "human" else Label.AI,
@@ -646,7 +732,7 @@ def _iter_daigt_proper(max_samples: int, cfg: DatasetConfig | None = None) -> It
         max_samples,
         cfg or DatasetConfig(),
         text_fields=("text", "essay", "essay_text", "content"),
-        label_fields=("label", "generated", "is_ai", "target", "generated_text"),
+        label_fields=("#label", "label", "generated", "is_ai", "target", "generated_text"),
         generator_fields=("source", "model", "generator"),
     )
 
@@ -657,7 +743,7 @@ def _iter_daigt_v2(max_samples: int, cfg: DatasetConfig | None = None) -> Iterat
         max_samples,
         cfg or DatasetConfig(),
         text_fields=("text", "essay", "essay_text", "content"),
-        label_fields=("label", "generated", "is_ai", "target", "generated_text"),
+        label_fields=("#label", "label", "generated", "is_ai", "target", "generated_text"),
         generator_fields=("source", "model", "generator"),
     )
 
@@ -709,8 +795,20 @@ def load_combined_dataset(config: DatasetConfig | None = None) -> LoadResult:
     cfg = config or DatasetConfig()
     rng = random.Random(cfg.seed)
 
-    sources = cfg.sources or cfg.available_sources
-    sources = [s for s in sources if s in _SOURCE_REGISTRY]
+    requested_sources = cfg.sources or cfg.available_sources
+    filtered_sources = [s for s in requested_sources if s in _SOURCE_REGISTRY]
+    sources: list[str] = []
+    seen_canonical_sources: set[str] = set()
+    for source_name in filtered_sources:
+        canonical_name = _canonical_source_name(source_name)
+        if canonical_name in seen_canonical_sources:
+            print(
+                f"Skipping {source_name} because it duplicates "
+                f"{canonical_name}."
+            )
+            continue
+        seen_canonical_sources.add(canonical_name)
+        sources.append(source_name)
 
     if not sources:
         raise ValueError(f"Нет валидных источников. Доступные: {list(_SOURCE_REGISTRY)}")
@@ -725,7 +823,8 @@ def load_combined_dataset(config: DatasetConfig | None = None) -> LoadResult:
         src_samples: list[Sample] = []
 
         try:
-            for sample in loader(cfg.max_per_source, cfg):
+            loaded_samples = _materialize_source(src_name, cfg.max_per_source, cfg, loader)
+            for sample in loaded_samples:
                 # Фильтр по длине
                 if len(sample.text) < cfg.min_text_length:
                     continue
@@ -825,6 +924,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--max-per-source", type=int, default=5_000)
     parser.add_argument("--max-total", type=int, default=20_000)
+    parser.add_argument("--cache-dir", default=".cache/datasets")
+    parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--no-balance", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -843,6 +944,8 @@ if __name__ == "__main__":
         balance_labels=not args.no_balance,
         seed=args.seed,
         source_paths=source_paths,
+        cache_dir=args.cache_dir,
+        cache_sources=not args.no_cache,
     )
 
     result = load_combined_dataset(cfg)
