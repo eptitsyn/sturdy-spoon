@@ -976,8 +976,8 @@ if __name__ == "__main__":
         default=[],
         help="Локальный путь в формате source=/abs/path. Нужен для daigt_proper и m_daigt.",
     )
-    parser.add_argument("--max-per-source", type=int, default=5_000)
-    parser.add_argument("--max-total", type=int, default=20_000)
+    parser.add_argument("--max-per-source", type=int, default=100_000)
+    parser.add_argument("--max-total", type=int, default=100_000)
     parser.add_argument("--cache-dir", default=".cache/datasets")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--no-balance", action="store_true")
