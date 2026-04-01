@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 import csv
 import hashlib
 import json
@@ -33,19 +32,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
-from ui import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    RICH_AVAILABLE,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    console,
-    print_info,
-    print_success,
-    print_warning,
-)
+from tqdm.auto import tqdm
+
+
+def print_info(message: str) -> None:
+    print(message)
+
+
+def print_success(message: str) -> None:
+    print(message)
+
+
+def print_warning(message: str) -> None:
+    print(message)
 
 
 def _load_dataset(*args, **kwargs):
@@ -1111,55 +1110,31 @@ def load_combined_dataset(config: DatasetConfig | None = None) -> LoadResult:
     all_samples: list[Sample] = []
     source_stats: dict[str, dict] = {}
 
-    progress_context = (
-        Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
+    for src_name in tqdm(sources, desc="Загрузка датасетов", unit="dataset"):
+        loader = _SOURCE_REGISTRY[src_name]
+        src_samples: list[Sample] = []
+
+        try:
+            loaded_samples = _materialize_source(src_name, cfg.max_per_source, cfg, loader)
+            for sample in loaded_samples:
+                if len(sample.text) < cfg.min_text_length:
+                    continue
+                if len(sample.text) > cfg.max_text_length:
+                    sample.text = sample.text[: cfg.max_text_length]
+                src_samples.append(sample)
+        except Exception as e:
+            print_warning(f"Не удалось загрузить {src_name}: {e}")
+            continue
+
+        n_human = sum(1 for s in src_samples if s.label == Label.HUMAN)
+        n_ai = len(src_samples) - n_human
+        source_stats[src_name] = {"total": len(src_samples), "human": n_human, "ai": n_ai}
+        print_success(
+            f"Загружен {src_name}: {len(src_samples):,} примеров "
+            f"(human={n_human:,}, ai={n_ai:,})"
         )
-        if RICH_AVAILABLE
-        else nullcontext()
-    )
-    with progress_context as progress:
-        task_id = progress.add_task("Loading datasets", total=len(sources)) if RICH_AVAILABLE else None
-        for src_name in sources:
-            if RICH_AVAILABLE:
-                progress.update(task_id, description=f"Loading {src_name}")
-            else:
-                print_info(f"Loading {src_name}...")
 
-            loader = _SOURCE_REGISTRY[src_name]
-            src_samples: list[Sample] = []
-
-            try:
-                loaded_samples = _materialize_source(src_name, cfg.max_per_source, cfg, loader)
-                for sample in loaded_samples:
-                    # Фильтр по длине
-                    if len(sample.text) < cfg.min_text_length:
-                        continue
-                    if len(sample.text) > cfg.max_text_length:
-                        sample.text = sample.text[: cfg.max_text_length]
-                    src_samples.append(sample)
-            except Exception as e:
-                print_warning(f"Failed to load {src_name}: {e}")
-                if RICH_AVAILABLE:
-                    progress.advance(task_id)
-                continue
-
-            n_human = sum(1 for s in src_samples if s.label == Label.HUMAN)
-            n_ai = len(src_samples) - n_human
-            source_stats[src_name] = {"total": len(src_samples), "human": n_human, "ai": n_ai}
-            print_success(
-                f"Loaded {src_name}: {len(src_samples):,} samples "
-                f"(human={n_human:,}, ai={n_ai:,})"
-            )
-
-            all_samples.extend(src_samples)
-            if RICH_AVAILABLE:
-                progress.advance(task_id)
+        all_samples.extend(src_samples)
 
     if not all_samples:
         raise RuntimeError("Не удалось загрузить ни одного сэмпла.")
@@ -1203,10 +1178,10 @@ def load_combined_dataset(config: DatasetConfig | None = None) -> LoadResult:
     }
 
     print_info("")
-    print_info(f"Combined dataset: {len(all_samples):,} samples")
+    print_info(f"Итоговый датасет: {len(all_samples):,} примеров")
     print_info(f"  Human: {n_human:,} | AI: {n_ai:,}")
-    print_info(f"  Sources: {list(source_stats)}")
-    print_info(f"  Generators: {stats['generators']}")
+    print_info(f"  Источники: {list(source_stats)}")
+    print_info(f"  Генераторы: {stats['generators']}")
     print_info("")
 
     texts = [s.text for s in all_samples]
