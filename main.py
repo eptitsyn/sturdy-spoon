@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import sys
 
 from sklearn.model_selection import train_test_split
 
@@ -34,9 +35,16 @@ FEATURE_PRESETS = {
 }
 
 
+def _is_interactive() -> bool:
+    return sys.stdin.isatty()
+
+
 def _prompt(label: str, default, cast=str):  # type: ignore[assignment]
     """Prompt with a default, return cast(value) or default on empty input."""
-    raw = input(f"  {label} [{default}]: ").strip()
+    try:
+        raw = input(f"  {label} [{default}]: ").strip()
+    except EOFError:
+        return default
     if not raw:
         return default
     try:
@@ -48,6 +56,8 @@ def _prompt(label: str, default, cast=str):  # type: ignore[assignment]
 
 def prompt_model_features(args: argparse.Namespace) -> argparse.Namespace:
     """Interactively ask the user which model features to use before training."""
+    if not _is_interactive():
+        return args
     print_section("Model Configuration")
 
     # ── Preset shortcut ──────────────────────────────────────────────────
@@ -70,7 +80,10 @@ def prompt_model_features(args: argparse.Namespace) -> argparse.Namespace:
     else:
         print(f"\n  Presets: {', '.join(preset_names)} (or press Enter to configure manually)\n")
 
-    preset = input("  Choose preset (or Enter to configure manually): ").strip().lower()
+    try:
+        preset = input("  Choose preset (or Enter to configure manually): ").strip().lower()
+    except EOFError:
+        preset = ""
     if preset in FEATURE_PRESETS:
         for k, v in FEATURE_PRESETS[preset].items():
             setattr(args, k, v)
@@ -96,13 +109,18 @@ def prompt_model_features(args: argparse.Namespace) -> argparse.Namespace:
 
 def _prompt_stylometric(args: argparse.Namespace) -> argparse.Namespace:
     """Ask whether to include stylometric features."""
+    if not _is_interactive():
+        return args
     default_str = "y" if args.stylometric else "n"
     print_info(
         "  Stylometric features: hand-crafted writing-style signals (avg word length,\n"
         "  sentence length variance, TTR, punctuation rate, etc.) concatenated to\n"
         "  the transformer pooled representation before the classifier head."
     )
-    raw = input(f"  Include stylometric features? [y/n] [{default_str}]: ").strip().lower()
+    try:
+        raw = input(f"  Include stylometric features? [y/n] [{default_str}]: ").strip().lower()
+    except EOFError:
+        return args
     if raw in ("y", "yes", "1", "true"):
         args.stylometric = True
     elif raw in ("n", "no", "0", "false"):
