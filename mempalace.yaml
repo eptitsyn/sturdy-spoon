@@ -1,0 +1,80 @@
+wing: ai_text_detector
+rooms:
+- name: model
+  description: Transformer architecture — AITextDetector, embeddings, positional encoding, multi-pooling, MLP head
+  keywords:
+  - model
+  - transformer
+  - encoder
+  - embedding
+  - attention
+  - pooling
+  - cls
+  - mlp
+  - architecture
+
+- name: data
+  description: BPETokenizer, TextClassificationDataset, collate_fn, tokenization, batching
+  keywords:
+  - tokenizer
+  - bpe
+  - dataset
+  - collate
+  - batch
+  - token
+  - encoding
+  - padding
+
+- name: datasets
+  description: Dataset loaders for RAID, HC3, GPT-Wiki, Human-vs-AI, DAIGT and other public AI detection corpora
+  keywords:
+  - raid
+  - hc3
+  - gpt_wiki
+  - daigt
+  - dataset_loader
+  - huggingface
+  - source
+  - corpus
+  - ai_pile
+  - ruatd
+
+- name: training
+  description: PyTorch Lightning training loop, TrainConfig, early stopping, checkpointing, LR scheduling
+  keywords:
+  - train
+  - lightning
+  - config
+  - epoch
+  - scheduler
+  - checkpoint
+  - callback
+  - early_stopping
+  - loss
+
+- name: evaluation
+  description: Evaluation metrics — F1, ROC-AUC, precision/recall, confusion matrix, threshold tuning, per-source breakdown
+  keywords:
+  - evaluate
+  - metrics
+  - f1
+  - auc
+  - roc
+  - threshold
+  - precision
+  - recall
+  - confusion
+
+- name: inference
+  description: Detector class — checkpoint loading, single and batch text prediction with sigmoid thresholding
+  keywords:
+  - inference
+  - detector
+  - predict
+  - sigmoid
+  - probability
+  - batch
+
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

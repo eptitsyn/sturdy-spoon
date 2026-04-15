@@ -18,7 +18,6 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
-    precision_recall_curve,
     roc_auc_score,
 )
 
@@ -43,7 +42,6 @@ class EvalResult:
     roc_auc: float
     confusion: np.ndarray          # 2×2
     threshold_used: float
-    optimal_threshold: float       # порог с лучшим F1
     report: str                    # sklearn classification_report
 
 
@@ -94,12 +92,6 @@ def evaluate_model(
     labels_arr = np.array(all_labels)
     probs = 1 / (1 + np.exp(-logits_arr))  # sigmoid
 
-    # ── Optimal threshold (max F1) ───────────────────────────────────────
-    precision_vals, recall_vals, thresholds_pr = precision_recall_curve(labels_arr, probs)
-    f1_vals = 2 * precision_vals * recall_vals / (precision_vals + recall_vals + 1e-8)
-    best_idx = np.argmax(f1_vals)
-    optimal_threshold = float(thresholds_pr[best_idx]) if best_idx < len(thresholds_pr) else 0.5
-
     # ── Predictions at configured threshold ───────────────────────────────
     preds_threshold = (probs >= threshold).astype(int)
 
@@ -137,7 +129,6 @@ def evaluate_model(
         roc_auc=auc,
         confusion=cm,
         threshold_used=threshold,
-        optimal_threshold=optimal_threshold,
         report=report,
     )
 
@@ -212,7 +203,6 @@ def print_eval_report(result: EvalResult, title: str = "Evaluation Report"):
         summary.add_row("F1 (macro)", f"{result.f1:.4f}")
         summary.add_row("ROC-AUC", f"{result.roc_auc:.4f}")
         summary.add_row("Threshold", f"{result.threshold_used:.3f}")
-        summary.add_row("Opt. thresh", f"{result.optimal_threshold:.3f}")
         console.print(summary)
 
         class_table = Table(title="Per-class metrics", box=box.SIMPLE_HEAVY)
@@ -242,7 +232,6 @@ def print_eval_report(result: EvalResult, title: str = "Evaluation Report"):
     print(f"  F1 (macro):  {result.f1:.4f}")
     print(f"  ROC-AUC:     {result.roc_auc:.4f}")
     print(f"  Threshold:   {result.threshold_used:.3f}")
-    print(f"  Opt. thresh: {result.optimal_threshold:.3f}")
     print(f"\n  {'':15s} {'Precision':>10s} {'Recall':>10s} {'F1':>10s}")
     print(f"  {'─'*45}")
     print(f"  {'Human':15s} {result.precision_human:10.4f} {result.recall_human:10.4f} {result.f1_human:10.4f}")

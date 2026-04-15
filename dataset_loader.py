@@ -1149,15 +1149,6 @@ def load_combined_dataset(config: DatasetConfig | None = None) -> LoadResult:
             balanced.extend(src[:min_per_source])
         all_samples = balanced
 
-    # ── Балансировка human/ai ─────────────────────────────────────────────
-    if cfg.balance_labels:
-        humans = [s for s in all_samples if s.label == Label.HUMAN]
-        ais = [s for s in all_samples if s.label == Label.AI]
-        min_count = min(len(humans), len(ais))
-        rng.shuffle(humans)
-        rng.shuffle(ais)
-        all_samples = humans[:min_count] + ais[:min_count]
-
     # ── Обрезка до max_total и шафл ──────────────────────────────────────
     rng.shuffle(all_samples)
     all_samples = all_samples[: cfg.max_total]

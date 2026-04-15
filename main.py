@@ -23,7 +23,93 @@ from dataset_loader import load_combined_dataset, DatasetConfig
 from train import train, TrainConfig
 from inference import Detector
 from evaluate import evaluate_model, evaluate_per_source, print_eval_report, print_source_breakdown
-from ui import RICH_AVAILABLE, Table, box, console, print_info, print_section
+from ui import RICH_AVAILABLE, Table, box, console, print_info, print_section, print_warning
+
+
+FEATURE_PRESETS = {
+    "tiny":   dict(d_model=128, nhead=4,  num_layers=2, dim_ff=256,  max_seq_len=256, vocab_size=10_000),
+    "small":  dict(d_model=256, nhead=8,  num_layers=4, dim_ff=512,  max_seq_len=512, vocab_size=30_000),
+    "medium": dict(d_model=384, nhead=8,  num_layers=6, dim_ff=1024, max_seq_len=512, vocab_size=50_000),
+    "large":  dict(d_model=512, nhead=8,  num_layers=8, dim_ff=2048, max_seq_len=512, vocab_size=50_000),
+}
+
+
+def _prompt(label: str, default, cast=str):  # type: ignore[assignment]
+    """Prompt with a default, return cast(value) or default on empty input."""
+    raw = input(f"  {label} [{default}]: ").strip()
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except (ValueError, TypeError):
+        print_warning(f"  Invalid input, using default: {default}")
+        return default
+
+
+def prompt_model_features(args: argparse.Namespace) -> argparse.Namespace:
+    """Interactively ask the user which model features to use before training."""
+    print_section("Model Configuration")
+
+    # ── Preset shortcut ──────────────────────────────────────────────────
+    preset_names = list(FEATURE_PRESETS)
+    if RICH_AVAILABLE:
+        from rich.table import Table as RTable
+        from rich import box as rbox
+        t = RTable(title="Presets", box=rbox.SIMPLE)
+        t.add_column("Name")
+        t.add_column("d_model", justify="right")
+        t.add_column("nhead", justify="right")
+        t.add_column("layers", justify="right")
+        t.add_column("dim_ff", justify="right")
+        t.add_column("seq_len", justify="right")
+        t.add_column("vocab", justify="right")
+        for name, cfg in FEATURE_PRESETS.items():
+            t.add_row(name, str(cfg["d_model"]), str(cfg["nhead"]), str(cfg["num_layers"]),
+                      str(cfg["dim_ff"]), str(cfg["max_seq_len"]), str(cfg["vocab_size"]))
+        console.print(t)
+    else:
+        print(f"\n  Presets: {', '.join(preset_names)} (or press Enter to configure manually)\n")
+
+    preset = input("  Choose preset (or Enter to configure manually): ").strip().lower()
+    if preset in FEATURE_PRESETS:
+        for k, v in FEATURE_PRESETS[preset].items():
+            setattr(args, k, v)
+        print_info(f"  Applied preset '{preset}'")
+        return args
+
+    # ── Manual configuration ─────────────────────────────────────────────
+    print_info("\n  --- Architecture ---")
+    args.d_model      = _prompt("Embedding dim (d_model)",  args.d_model,      int)
+    args.nhead        = _prompt("Attention heads (nhead)",  args.nhead,        int)
+    args.num_layers   = _prompt("Encoder layers",           args.num_layers,   int)
+    args.dim_ff       = _prompt("Feed-forward dim (dim_ff)", args.dim_ff,      int)
+    args.max_seq_len  = _prompt("Max sequence length",      args.max_seq_len,  int)
+    args.vocab_size   = _prompt("Vocabulary size",          args.vocab_size,   int)
+
+    print_info("\n  --- Training ---")
+    args.epochs       = _prompt("Epochs",                   args.epochs,       int)
+    args.batch_size   = _prompt("Batch size",               args.batch_size,   int)
+    args.lr           = _prompt("Learning rate",            args.lr,           float)
+
+    return args
+
+
+def _prompt_stylometric(args: argparse.Namespace) -> argparse.Namespace:
+    """Ask whether to include stylometric features."""
+    default_str = "y" if args.stylometric else "n"
+    print_info(
+        "  Stylometric features: hand-crafted writing-style signals (avg word length,\n"
+        "  sentence length variance, TTR, punctuation rate, etc.) concatenated to\n"
+        "  the transformer pooled representation before the classifier head."
+    )
+    raw = input(f"  Include stylometric features? [y/n] [{default_str}]: ").strip().lower()
+    if raw in ("y", "yes", "1", "true"):
+        args.stylometric = True
+    elif raw in ("n", "no", "0", "false"):
+        args.stylometric = False
+    # empty → keep current default
+    print_info(f"  Stylometric features: {'enabled' if args.stylometric else 'disabled'}")
+    return args
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +145,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=42)
+
+    # Features
+    p.add_argument("--stylometric", action="store_true", default=False,
+                   help="Augment token embeddings with hand-crafted stylometric features")
+    p.add_argument("--no-stylometric", dest="stylometric", action="store_false")
 
     return p.parse_args()
 
@@ -144,10 +235,30 @@ def main():
     train_texts, train_labels, test_texts, test_labels, test_samples = split_data(
         result, args.test_ratio, args.seed
     )
+
+    # Балансировка human/ai только на трейне
+    if data_cfg.balance_labels:
+        import random as _random
+        rng = _random.Random(args.seed)
+        paired = list(zip(train_texts, train_labels))
+        humans = [(t, lbl) for t, lbl in paired if lbl == 0]
+        ais = [(t, lbl) for t, lbl in paired if lbl == 1]
+        min_count = min(len(humans), len(ais))
+        rng.shuffle(humans)
+        rng.shuffle(ais)
+        balanced = humans[:min_count] + ais[:min_count]
+        rng.shuffle(balanced)
+        train_texts, train_labels = zip(*balanced) if balanced else ([], [])
+        train_texts, train_labels = list(train_texts), list(train_labels)
+
     print_info(f"Train: {len(train_texts):,} | Test: {len(test_texts):,}")
 
-    # ── 2. Тренировка ────────────────────────────────────────────────────
-    print_section("STEP 2: Training")
+    # ── 2. Конфигурация модели (интерактивно) ────────────────────────────
+    args = prompt_model_features(args)
+
+    # ── 3. Тренировка ────────────────────────────────────────────────────
+    print_section("STEP 3: Training")
+    args = _prompt_stylometric(args)
 
     train_cfg = TrainConfig(
         d_model=args.d_model,
@@ -164,8 +275,8 @@ def main():
 
     model, tokenizer, threshold = train(train_texts, train_labels, train_cfg)
 
-    # ── 3. Оценка на тестовой выборке ────────────────────────────────────
-    print_section("STEP 3: Evaluation on held-out test set")
+    # ── 4. Оценка на тестовой выборке ────────────────────────────────────
+    print_section("STEP 4: Evaluation on held-out test set")
 
     eval_result = evaluate_model(
         model, tokenizer, test_texts, test_labels,
@@ -181,7 +292,7 @@ def main():
         print_source_breakdown(breakdowns)
 
     # ── 5. Живые примеры ─────────────────────────────────────────────────
-    print_section("STEP 4: Live inference examples")
+    print_section("STEP 5: Live inference examples")
 
     examples = [
         ("Ну блин, опять забыл зонт и промок как собака.", "Human"),
